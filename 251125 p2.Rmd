@@ -1,0 +1,1374 @@
+---
+title: "251125 p2"
+author: "Leong Jun Chuen"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+############################################################
+# 0. Libraries & helpers
+############################################################
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lubridate)
+  library(forecast)
+  library(tseries)
+  library(ggplot2)
+  library(vars)
+  library(urca)
+  library(knitr)
+})
+
+# Accuracy helper (same as you had)
+safe_accuracy <- function(fc, ytest) {
+  A <- accuracy(fc, ytest)
+  A[, intersect(c("ME","RMSE","MAE","MPE","MAPE","MASE","ACF1","Theil's U"),
+                colnames(A)), drop = FALSE]
+}
+
+# ADF lag rule-of-thumb
+adf_k <- function(x) trunc((length(na.omit(x)) - 1)^(1/3))
+
+
+############################################################
+# 1. Load & clean data
+############################################################
+df <- read.csv("original.csv", stringsAsFactors = FALSE)
+
+norm_str <- function(x) tolower(trimws(as.character(x)))
+df <- df %>%
+  mutate(
+    series = norm_str(series),
+    sector = norm_str(sector),
+    value  = as.numeric(gsub(",", "", as.character(value)))
+  )
+
+# Try several date formats
+d0 <- suppressWarnings(dmy(df$date))
+d1 <- suppressWarnings(ymd(df$date))
+d2 <- suppressWarnings(mdy(df$date))
+df$date <- coalesce(d0, d1, d2)
+stopifnot(!all(is.na(df$date)))
+
+abs_df <- df %>%
+  filter(series == "abs", !is.na(value)) %>%
+  arrange(date)
+
+# GDP total (p0)
+gdp  <- abs_df %>%
+  dplyr::filter(sector %in% c("p0","gdp","gross domestic product","jumlah","kdnk")) %>%
+  dplyr::arrange(date) %>%
+  dplyr::select(date, p0 = value)
+
+agri <- abs_df %>%
+  dplyr::filter(sector %in% c("p1","agriculture","agriculture, forestry & fishing","pertanian")) %>%
+  dplyr::arrange(date) %>%
+  dplyr::select(date, p1 = value)
+
+dat <- inner_join(gdp, agri, by = "date") %>%
+  arrange(date)
+
+
+
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+############################################################
+# 2. Build quarterly ts objects
+############################################################
+ts_p0 <- ts(dat$p0,
+            start = c(year(min(dat$date)), quarter(min(dat$date))),
+            frequency = 4)
+ts_p1 <- ts(dat$p1,
+            start = start(ts_p0),
+            frequency = 4)
+
+# Optional: agriculture share
+ts_share <- ts(100 * dat$p1 / dat$p0,
+               start = start(ts_p0),
+               frequency = 4)
+
+tq <- time(ts_p0)  # time index
+
+```
+
+```{r}
+############################################################
+# 3. Deterministic terms: trend, seasonal dummies, pulses
+############################################################
+
+# Linear time trend (for full sample)
+trend_full <- 1:length(ts_p0)
+
+# Quarterly seasonal dummies: 3 columns (Q1, Q2, Q3; Q4 is baseline)
+season_full <- seasonaldummy(ts_p0)
+
+# Pulses: COVID and 2022Q2 shock
+X_pulses <- cbind(
+  covid_q2     = as.numeric(tq == 2020 + 1/4),
+  covid_q3     = as.numeric(tq == 2020 + 2/4),
+  shock_2022q2 = as.numeric(tq == 2022 + 1/4)
+)
+
+# For convenience, full exogenous matrix
+exog_full <- cbind(trend = trend_full,
+                   season_full,
+                   X_pulses)
+
+# Logs for cointegration
+log_p0 <- log(ts_p0)
+log_p1 <- log(ts_p1)
+
+y_levels <- cbind(log_p0, log_p1)
+colnames(y_levels) <- c("log_p0", "log_p1")
+
+```
+
+```{r}
+############################################################
+# 4. Train / test split (up to 2023Q4 as train)
+############################################################
+cut_year <- c(2023, 4)
+cut_time <- 2023 + 3/4  # 2023Q4 in decimal
+
+y_train <- window(y_levels, end   = cut_year)
+y_test  <- window(y_levels, start = c(2024, 1))
+
+train_mask <- (time(ts_p0) <= cut_time)
+test_mask  <- !train_mask
+
+exog_train <- exog_full[train_mask, , drop = FALSE]
+exog_test  <- exog_full[test_mask,  , drop = FALSE]
+
+stopifnot(nrow(y_train) == nrow(exog_train))
+
+
+############################################################
+# 5. Basic plots: levels vs diffs (for thesis)
+############################################################
+
+# Convert to data frames for ggplot
+df_ts <- tibble(
+  date = dat$date,
+  log_p0 = as.numeric(log_p0),
+  log_p1 = as.numeric(log_p1)
+)
+
+df_diff <- tibble(
+  date = dat$date[-1],
+  d1_log_p0 = diff(log_p0),
+  d1_log_p1 = diff(log_p1)
+)
+
+df_sdiff <- tibble(
+  date = dat$date[-(1:4)],
+  d4_log_p0 = diff(log_p0, lag = 4),
+  d4_log_p1 = diff(log_p1, lag = 4)
+)
+
+# Levels
+ggplot(df_ts, aes(x = date)) +
+  geom_line(aes(y = log_p0, colour = "log_p0")) +
+  geom_line(aes(y = log_p1, colour = "log_p1")) +
+  labs(title = "Log GDP (p0) and Log Agriculture GDP (p1)",
+       y = "log value", colour = "") +
+  theme_minimal()
+
+# First differences
+ggplot(df_diff, aes(x = date)) +
+  geom_line(aes(y = d1_log_p0, colour = "Δ log_p0")) +
+  geom_line(aes(y = d1_log_p1, colour = "Δ log_p1")) +
+  labs(title = "First Differences of Logs",
+       y = "Δ log", colour = "") +
+  theme_minimal()
+
+# Seasonal (lag-4) differences
+ggplot(df_sdiff, aes(x = date)) +
+  geom_line(aes(y = d4_log_p0, colour = "Δ4 log_p0")) +
+  geom_line(aes(y = d4_log_p1, colour = "Δ4 log_p1")) +
+  labs(title = "Seasonal (lag-4) Differences of Logs",
+       y = "Δ4 log", colour = "") +
+  theme_minimal()
+
+```
+
+```{r}
+############################################################
+# 6. Unit-root tests: ADF + KPSS (TRAIN sample)
+############################################################
+
+# TRAIN sample series
+ts_p0_tr <- window(ts_p0, end = cut_year)
+ts_p1_tr <- window(ts_p1, end = cut_year)
+log_p0_tr <- window(log_p0, end = cut_year)
+log_p1_tr <- window(log_p1, end = cut_year)
+
+-
+
+# Differences (train)
+d1_log_p0_tr <- diff(log_p0_tr, lag = 1)
+d1_log_p1_tr <- diff(log_p1_tr, lag = 1)
+d4_log_p0_tr <- diff(log_p0_tr, lag = 4)
+d4_log_p1_tr <- diff(log_p1_tr, lag = 4)
+
+# ADF on levels
+adf_logp0_lvl_tr <- adf.test(log_p0_tr, k = adf_k(log_p0_tr))
+adf_logp1_lvl_tr <- adf.test(log_p1_tr, k = adf_k(log_p1_tr))
+
+# ADF on first diffs
+adf_logp0_diff_tr <- adf.test(d1_log_p0_tr, k = adf_k(d1_log_p0_tr))
+adf_logp1_diff_tr <- adf.test(d1_log_p1_tr, k = adf_k(d1_log_p1_tr))
+
+# ADF on seasonal diffs
+adf_logp0_sdiff_tr <- adf.test(d4_log_p0_tr, k = adf_k(d4_log_p0_tr))
+adf_logp1_sdiff_tr <- adf.test(d4_log_p1_tr, k = adf_k(d4_log_p1_tr))
+
+# KPSS (level-stationary) on diffs
+kpss_d1_p0 <- kpss.test(d1_log_p0_tr, null = "Level")
+kpss_d1_p1 <- kpss.test(d1_log_p1_tr, null = "Level")
+kpss_d4_p0 <- kpss.test(d4_log_p0_tr, null = "Level")
+kpss_d4_p1 <- kpss.test(d4_log_p1_tr, null = "Level")
+
+# Print summaries
+adf_logp0_lvl_tr
+adf_logp1_lvl_tr
+adf_logp0_diff_tr
+adf_logp1_diff_tr
+adf_logp0_sdiff_tr
+adf_logp1_sdiff_tr
+
+kpss_d1_p0
+kpss_d1_p1
+kpss_d4_p0
+kpss_d4_p1
+
+# (Optional) small summary table for thesis
+adf_kpss_table <- tibble(
+  Series = c("log_p0_tr", "log_p1_tr",
+             "Δ log_p0_tr", "Δ log_p1_tr",
+             "Δ4 log_p0_tr", "Δ4 log_p1_tr"),
+  ADF_stat = c(adf_logp0_lvl_tr$statistic,
+               adf_logp1_lvl_tr$statistic,
+               adf_logp0_diff_tr$statistic,
+               adf_logp1_diff_tr$statistic,
+               adf_logp0_sdiff_tr$statistic,
+               adf_logp1_sdiff_tr$statistic),
+  ADF_p    = c(adf_logp0_lvl_tr$p.value,
+               adf_logp1_lvl_tr$p.value,
+               adf_logp0_diff_tr$p.value,
+               adf_logp1_diff_tr$p.value,
+               adf_logp0_sdiff_tr$p.value,
+               adf_logp1_sdiff_tr$p.value),
+  KPSS_stat = c(NA, NA,
+                kpss_d1_p0$statistic,
+                kpss_d1_p1$statistic,
+                kpss_d4_p0$statistic,
+                kpss_d4_p1$statistic),
+  KPSS_p    = c(NA, NA,
+                kpss_d1_p0$p.value,
+                kpss_d1_p1$p.value,
+                kpss_d4_p0$p.value,
+                kpss_d4_p1$p.value)
+)
+
+kable(adf_kpss_table, digits = 4,
+      caption = "ADF and KPSS tests on levels and differences (training sample)")
+
+
+```
+
+```{r}
+
+############################################################
+# 7. Trend vs stochastic trend: residual ADF & KPSS on levels
+############################################################
+
+t_tr <- 1:length(log_p0_tr)
+lm_p0 <- lm(log_p0_tr ~ t_tr)
+lm_p1 <- lm(log_p1_tr ~ t_tr)
+
+summary(lm_p0)
+summary(lm_p1)
+
+res_p0 <- resid(lm_p0)
+res_p1 <- resid(lm_p1)
+
+# ADF on residuals (test for trend-stationarity)
+adf_res_p0 <- adf.test(res_p0, k = adf_k(res_p0))
+adf_res_p1 <- adf.test(res_p1, k = adf_k(res_p1))
+adf_res_p0
+adf_res_p1
+
+# KPSS for trend-stationarity (on levels)
+kpss_logp0_tr_mu   <- kpss.test(log_p0_tr, null = "Level")
+kpss_logp0_tr_trend<- kpss.test(log_p0_tr, null = "Trend")
+kpss_logp1_tr_mu   <- kpss.test(log_p1_tr, null = "Level")
+kpss_logp1_tr_trend<- kpss.test(log_p1_tr, null = "Trend")
+
+kpss_logp0_tr_mu
+kpss_logp0_tr_trend
+kpss_logp1_tr_mu
+kpss_logp1_tr_trend
+
+# Plot residuals (for thesis)
+res_df <- tibble(
+  date = dat$date[train_mask],
+  res_p0 = res_p0,
+  res_p1 = res_p1
+)
+
+ggplot(res_df, aes(x = date)) +
+  geom_line(aes(y = res_p0, colour = "res(log_p0_tr)")) +
+  geom_line(aes(y = res_p1, colour = "res(log_p1_tr)")) +
+  labs(title = "Residuals after removing linear trend",
+       y = "residual", colour = "") +
+  theme_minimal()
+```
+
+
+```{r}
+# Assuming your time series data is stored in log_p0_tr and log_p1_tr
+library(forecast)
+library(ggplot2)
+
+# Perform STL decomposition
+log_p0_stl <- stl(log_p0_tr, s.window = "periodic")
+log_p1_stl <- stl(log_p1_tr, s.window = "periodic")
+
+# Plot the decomposed components
+# For log_p0_tr
+autoplot(log_p0_stl) + 
+  ggtitle("STL Decomposition of log_p0_tr")
+
+# For log_p1_tr
+autoplot(log_p1_stl) + 
+  ggtitle("STL Decomposition of log_p1_tr")
+
+
+# Install the GGally package if you haven't already
+
+library(GGally)
+
+# Lag Plot for log_p0_tr
+gglagplot(log_p0_tr, lags = 10) +
+  ggtitle("Lag Plot for log_p0_tr")
+
+# Lag Plot for log_p1_tr
+gglagplot(log_p1_tr, lags = 10) +
+  ggtitle("Lag Plot for log_p1_tr")
+
+ggseasonplot(ts_p0)
+
+library(forecast)
+
+tsoutliers(ts_p0)
+tsoutliers(ts_p1)
+
+
+
+```
+
+
+
+```{r}
+# Full dataset series
+log_p0_full <- log(ts_p0)
+log_p1_full <- log(ts_p1)
+
+# Differences (full dataset)
+d1_log_p0_full <- diff(log_p0_full, lag = 1)
+d1_log_p1_full <- diff(log_p1_full, lag = 1)
+d4_log_p0_full <- diff(log_p0_full, lag = 4)
+d4_log_p1_full <- diff(log_p1_full, lag = 4)
+
+# ADF on levels
+adf_logp0_lvl_full <- adf.test(log_p0_full, k = adf_k(log_p0_full))
+adf_logp1_lvl_full <- adf.test(log_p1_full, k = adf_k(log_p1_full))
+
+# ADF on first diffs
+adf_logp0_diff_full <- adf.test(d1_log_p0_full, k = adf_k(d1_log_p0_full))
+adf_logp1_diff_full <- adf.test(d1_log_p1_full, k = adf_k(d1_log_p1_full))
+
+# ADF on seasonal diffs
+adf_logp0_sdiff_full <- adf.test(d4_log_p0_full, k = adf_k(d4_log_p0_full))
+adf_logp1_sdiff_full <- adf.test(d4_log_p1_full, k = adf_k(d4_log_p1_full))
+
+# KPSS on diffs
+kpss_d1_p0_full <- kpss.test(d1_log_p0_full, null = "Level")
+kpss_d1_p1_full <- kpss.test(d1_log_p1_full, null = "Level")
+kpss_d4_p0_full <- kpss.test(d4_log_p0_full, null = "Level")
+kpss_d4_p1_full <- kpss.test(d4_log_p1_full, null = "Level")
+
+
+
+```
+All STL KPSS STUFF
+```{r}
+
+############################################################
+# STL decomposition and seasonal adjustment (TRAIN only)
+############################################################
+library(forecast)
+
+log_p0_stl <- stl(log_p0_tr, s.window = "periodic")
+log_p1_stl <- stl(log_p1_tr, s.window = "periodic")
+
+#------------------------------------------------------------
+# seasonally adjusted logs
+log_p0_sa_tr <- seasadj(log_p0_stl)
+log_p1_sa_tr <- seasadj(log_p1_stl)
+
+autoplot(log_p0_stl) + ggtitle("STL decomposition: log_p0_tr")
+autoplot(log_p1_stl) + ggtitle("STL decomposition: log_p1_tr")
+
+
+d1_log_p0_sa_tr <- diff(log_p0_sa_tr)
+d1_log_p1_sa_tr <- diff(log_p1_sa_tr)
+
+y_d1_sa <- cbind(d1_log_p0_sa_tr, d1_log_p1_sa_tr)
+colnames(y_d1_sa) <- c("d1_log_p0_sa", "d1_log_p1_sa")
+
+# Check basic plots
+autoplot(y_d1_sa) +
+  ggtitle("First differences of STL-adjusted log GDP and agri GDP") +
+  ylab("Δ log (seasonally adjusted)") +
+  theme_minimal()
+
+
+#-----------------------------------------------------------
+############################################################
+# 3.x Unit-root tests for STL-adjusted series (TRAIN)
+############################################################
+
+# First differences of STL-adjusted logs
+d1_log_p0_sa_tr <- diff(log_p0_sa_tr)
+d1_log_p1_sa_tr <- diff(log_p1_sa_tr)
+
+# ADF on STL-adjusted levels (expect: non-stationary, fail to reject unit root)
+adf_logp0_sa_lvl <- adf.test(log_p0_sa_tr, k = adf_k(log_p0_sa_tr))
+adf_logp1_sa_lvl <- adf.test(log_p1_sa_tr, k = adf_k(log_p1_sa_tr))
+
+# ADF on first differences (expect: stationary, reject unit root)
+adf_logp0_sa_diff <- adf.test(d1_log_p0_sa_tr, k = adf_k(d1_log_p0_sa_tr))
+adf_logp1_sa_diff <- adf.test(d1_log_p1_sa_tr, k = adf_k(d1_log_p1_sa_tr))
+
+# KPSS on STL-adjusted levels: test trend-stationarity vs unit root
+kpss_logp0_sa_trend <- kpss.test(log_p0_sa_tr, null = "Trend")
+kpss_logp1_sa_trend <- kpss.test(log_p1_sa_tr, null = "Trend")
+
+# KPSS on first differences: test level-stationarity (expect: stationarity)
+kpss_d1_p0_sa_level <- kpss.test(d1_log_p0_sa_tr, null = "Level")
+kpss_d1_p1_sa_level <- kpss.test(d1_log_p1_sa_tr, null = "Level")
+
+# Print raw outputs (for log)
+adf_logp0_sa_lvl
+adf_logp1_sa_lvl
+adf_logp0_sa_diff
+adf_logp1_sa_diff
+
+kpss_logp0_sa_trend
+kpss_logp1_sa_trend
+kpss_d1_p0_sa_level
+kpss_d1_p1_sa_level
+
+# Optional: tidy summary table for thesis
+adf_kpss_sa_table <- tibble(
+  Series = c("log_p0_sa_tr", "log_p1_sa_tr",
+             "Δ log_p0_sa_tr", "Δ log_p1_sa_tr"),
+  ADF_stat = c(adf_logp0_sa_lvl$statistic,
+               adf_logp1_sa_lvl$statistic,
+               adf_logp0_sa_diff$statistic,
+               adf_logp1_sa_diff$statistic),
+  ADF_p    = c(adf_logp0_sa_lvl$p.value,
+               adf_logp1_sa_lvl$p.value,
+               adf_logp0_sa_diff$p.value,
+               adf_logp1_sa_diff$p.value),
+  KPSS_stat = c(kpss_logp0_sa_trend$statistic,
+                kpss_logp1_sa_trend$statistic,
+                kpss_d1_p0_sa_level$statistic,
+                kpss_d1_p1_sa_level$statistic),
+  KPSS_p    = c(kpss_logp0_sa_trend$p.value,
+                kpss_logp1_sa_trend$p.value,
+                kpss_d1_p0_sa_level$p.value,
+                kpss_d1_p1_sa_level$p.value)
+)
+
+kable(adf_kpss_sa_table, digits = 4,
+      caption = "ADF and KPSS tests for STL-adjusted series (training sample)")
+
+```
+STL FULL DATA
+```{r}
+############################################################
+# STL decomposition and unit-root tests on FULL sample
+############################################################
+
+# 1. Logs of full GDP series (p0, p1)
+log_p0_full <- log(ts_p0)
+log_p1_full <- log(ts_p1)
+
+# 2. STL decomposition on FULL sample
+#    s.window = "periodic" => same seasonal pattern each year (quarterly)
+log_p0_stl_full <- stl(log_p0_full, s.window = "periodic")
+log_p1_stl_full <- stl(log_p1_full, s.window = "periodic")
+
+# 3. Seasonally adjusted logs (FULL sample)
+log_p0_sa_full <- seasadj(log_p0_stl_full)
+log_p1_sa_full <- seasadj(log_p1_stl_full)
+
+# Plots for thesis: show decomposition on the full sample
+autoplot(log_p0_stl_full) + 
+  ggtitle("STL decomposition (full sample): log_p0 (GDP)") +
+  theme_minimal()
+
+autoplot(log_p1_stl_full) + 
+  ggtitle("STL decomposition (full sample): log_p1 (Agriculture GDP)") +
+  theme_minimal()
+
+# 4. First differences of STL-adjusted logs (FULL sample)
+d1_log_p0_sa_full <- diff(log_p0_sa_full)
+d1_log_p1_sa_full <- diff(log_p1_sa_full)
+
+autoplot(cbind(d1_log_p0_sa_full, d1_log_p1_sa_full)) +
+  ggtitle("First differences of STL-adjusted logs (full sample)") +
+  ylab("Δ log (seasonally adjusted)") +
+  theme_minimal()
+
+############################################################
+# 5. ADF & KPSS tests on STL-adjusted series (FULL sample)
+############################################################
+
+# ADF on STL-adjusted levels (expect: non-stationary, I(1))
+adf_logp0_sa_lvl_full <- adf.test(log_p0_sa_full,
+                                  k = adf_k(log_p0_sa_full))
+adf_logp1_sa_lvl_full <- adf.test(log_p1_sa_full,
+                                  k = adf_k(log_p1_sa_full))
+
+# ADF on first differences (expect: stationary, I(0))
+adf_logp0_sa_diff_full <- adf.test(d1_log_p0_sa_full,
+                                   k = adf_k(d1_log_p0_sa_full))
+adf_logp1_sa_diff_full <- adf.test(d1_log_p1_sa_full,
+                                   k = adf_k(d1_log_p1_sa_full))
+
+# KPSS on STL-adjusted levels: test for trend-stationarity
+# (expect to REJECT trend-stationarity if series are I(1))
+kpss_logp0_sa_trend_full <- kpss.test(log_p0_sa_full, null = "Trend")
+kpss_logp1_sa_trend_full <- kpss.test(log_p1_sa_full, null = "Trend")
+
+# KPSS on first differences: test for level-stationarity
+# (expect NOT to reject if differences are I(0))
+kpss_d1_p0_sa_level_full <- kpss.test(d1_log_p0_sa_full, null = "Level")
+kpss_d1_p1_sa_level_full <- kpss.test(d1_log_p1_sa_full, null = "Level")
+
+# Print raw outputs (for your own inspection / appendix)
+adf_logp0_sa_lvl_full
+adf_logp1_sa_lvl_full
+adf_logp0_sa_diff_full
+adf_logp1_sa_diff_full
+
+kpss_logp0_sa_trend_full
+kpss_logp1_sa_trend_full
+kpss_d1_p0_sa_level_full
+kpss_d1_p1_sa_level_full
+
+############################################################
+# 6. Summary table for thesis (FULL sample)
+############################################################
+
+adf_kpss_sa_full_table <- tibble(
+  Series = c("log_p0_sa_full", "log_p1_sa_full",
+             "Δ log_p0_sa_full", "Δ log_p1_sa_full"),
+  ADF_stat = c(adf_logp0_sa_lvl_full$statistic,
+               adf_logp1_sa_lvl_full$statistic,
+               adf_logp0_sa_diff_full$statistic,
+               adf_logp1_sa_diff_full$statistic),
+  ADF_p    = c(adf_logp0_sa_lvl_full$p.value,
+               adf_logp1_sa_lvl_full$p.value,
+               adf_logp0_sa_diff_full$p.value,
+               adf_logp1_sa_diff_full$p.value),
+  KPSS_stat = c(kpss_logp0_sa_trend_full$statistic,
+                kpss_logp1_sa_trend_full$statistic,
+                kpss_d1_p0_sa_level_full$statistic,
+                kpss_d1_p1_sa_level_full$statistic),
+  KPSS_p    = c(kpss_logp0_sa_trend_full$p.value,
+                kpss_logp1_sa_trend_full$p.value,
+                kpss_d1_p0_sa_level_full$p.value,
+                kpss_d1_p1_sa_level_full$p.value)
+)
+
+kable(adf_kpss_sa_full_table, digits = 4,
+      caption = "ADF and KPSS tests for STL-adjusted GDP and agriculture (full sample)")
+
+```
+
+```{r}
+############################################################
+# Does COVID make Δ log_p1_sa_full "look" non-stationary?
+# Regress out COVID / shock dummies and test residuals
+############################################################
+
+# Match pulse dummies to the time index of d1_log_p1_sa_full
+t_all      <- time(log_p1_sa_full)
+t_d1       <- time(d1_log_p1_sa_full)
+
+X_pulses_full <- X_pulses[match(t_all, time(ts_p0)), , drop = FALSE]
+X_pulses_d1   <- X_pulses_full[match(t_d1, t_all), , drop = FALSE]
+
+# Simple regression of Δlog on pulses
+lm_d1_p1_sa <- lm(d1_log_p1_sa_full ~ X_pulses_d1)
+summary(lm_d1_p1_sa)
+
+res_d1_p1_sa <- resid(lm_d1_p1_sa)
+
+# Unit-root tests on residuals
+adf_res_d1_p1_sa  <- adf.test(res_d1_p1_sa, k = adf_k(res_d1_p1_sa))
+kpss_res_d1_p1_sa <- kpss.test(res_d1_p1_sa, null = "Level")
+
+adf_res_d1_p1_sa
+kpss_res_d1_p1_sa
+
+```
+
+
+
+
+
+```{r}
+
+############################################################
+# 8. Johansen cointegration test with seasonal dummies
+############################################################
+
+# Seasonal dummies for TRAIN only
+S_train <- season_full[train_mask, , drop = FALSE]
+
+# Choose lag order in levels (including seasonal dummies as exogenous)
+lag_sel <- VARselect(y_train,
+                     lag.max = 4,
+                     type    = "trend",
+                     exogen  = S_train)
+lag_sel$selection
+p_opt <- lag_sel$selection["AIC(n)"]
+K_joh <- max(2, as.integer(p_opt) + 1)  # Johansen uses K-1 lags in Δ
+
+# Johansen with trend in cointegration + seasonal dummies
+joh_trend <- ca.jo(
+  y_train,
+  type   = "trace",
+  ecdet  = "trend",    # trend in cointegration space
+  K      = K_joh,
+  dumvar = S_train     # seasonal dummies only
+)
+summary(joh_trend)
+
+# Engle-Granger style residual test (validation)
+trend_ts <- ts(1:nrow(y_train), start = start(y_train), frequency = 4)
+Y_aug <- cbind(
+  log_p0 = y_train[,1],
+  log_p1 = y_train[,2],
+  trend  = trend_ts
+)
+
+beta_vec <- joh_trend@V[,1]   # first cointegration vector
+ect      <- Y_aug %*% beta_vec
+ect      <- ts(ect, start = start(y_train), frequency = 4)
+
+autoplot(ect) +
+  ggtitle("Cointegration Residual (ECT) from Johansen") +
+  ylab("ECT") +
+  theme_minimal()
+
+# ADF on ECT: MUST be stationary if cointegrated
+adf_ect <- adf.test(as.numeric(ect), k = adf_k(ect))
+adf_ect
+
+# If ADF on ect fails to reject unit root => no valid cointegration => use VAR in diffs
+```
+
+```{r}
+
+############################################################
+# 9. FINAL MODELS: VAR on stationary transforms
+############################################################
+# You can choose either:
+#   Model A: VAR on first differences with seasonal dummies + pulses
+#   Model B: VAR on seasonal differences with pulses only
+# Both are shown; pick one as your main model.
+
+############################################################
+# 9A. Model A: VAR in Δ log with seasonal dummies + pulses
+############################################################
+
+d1_log_p0_tr <- diff(log_p0_tr)
+d1_log_p1_tr <- diff(log_p1_tr)
+y_d1 <- cbind(d1_log_p0_tr, d1_log_p1_tr)
+colnames(y_d1) <- c("d1_log_p0", "d1_log_p1")
+
+# Align exogenous for differenced series (drop first obs)
+S_tr_d1 <- S_train[-1, , drop = FALSE]
+X_pulses_tr <- X_pulses[train_mask, , drop = FALSE]
+X_p_tr_d1 <- X_pulses_tr[-1, , drop = FALSE]
+X_d1 <- cbind(S_tr_d1, X_p_tr_d1)
+
+# Lag selection
+lag_sel_d1 <- VARselect(y_d1, lag.max = 4, type = "both", exogen = X_d1)
+lag_sel_d1$selection
+p_d1 <- as.integer(lag_sel_d1$selection["AIC(n)"])
+lag_sel_d1$criteria
+
+var_d1 <- VAR(
+  y_d1,
+  p      = p_d1,
+  type   = "both",
+  exogen = X_d1
+)
+summary(var_d1)
+
+# Residual diagnostics
+serial.test(var_d1, lags.pt = 8, type = "PT.asymptotic")  # Portmanteau
+arch.test(var_d1, lags.multi = 4)
+normality.test(var_d1)
+
+# Optional: plot residuals
+plot(resid(var_d1), main = "VAR(Δ log) residuals")
+
+
+############################################################
+# 9B. Model B: VAR in Δ4 log with pulses only
+############################################################
+
+d4_log_p0_tr <- diff(log_p0_tr, lag = 4)
+d4_log_p1_tr <- diff(log_p1_tr, lag = 4)
+y_d4 <- cbind(d4_log_p0_tr, d4_log_p1_tr)
+colnames(y_d4) <- c("d4_log_p0", "d4_log_p1")
+
+# Align pulses with Δ4 series (drop first 4 obs)
+X_p_tr <- X_pulses[train_mask, , drop = FALSE]
+t_y_d4 <- time(y_d4)
+X_p_d4 <- X_p_tr[match(t_y_d4, tq[train_mask]), , drop = FALSE]
+
+# Lag selection
+lag_sel_d4 <- VARselect(y_d4, lag.max = 4, type = "trend", exogen = X_p_d4)
+lag_sel_d4$selection
+p_d4 <- as.integer(lag_sel_d4$selection["AIC(n)"])
+
+var_d4 <- VAR(
+  y_d4,
+  p      = p_d4,
+  type   = "trend",
+  exogen = X_p_d4
+)
+summary(var_d4)
+
+# Residual diagnostics
+serial.test(var_d4, lags.pt = 8, type = "PT.asymptotic")
+arch.test(var_d4, lags.multi = 4)
+normality.test(var_d4)
+# Apply Ljung-Box test to each residual series
+lb_test_p0 <- Box.test(residuals(var_d4)[, 1], lag = 8, type = "Ljung-Box")  # Residuals for d4_log_p0
+lb_test_p1 <- Box.test(residuals(var_d4)[, 2], lag = 8, type = "Ljung-Box")  # Residuals for d4_log_p1
+
+# Print the results
+print(lb_test_p0)
+print(lb_test_p1)
+
+
+plot(resid(var_d4), main = "VAR(Δ4 log) residuals")
+
+
+############################################################
+# 9C. Model C: VAR in Δ log of seasonally adjusted series
+############################################################
+
+# 1-step differences of seasonally adjusted logs
+d1_log_p0_sa_tr <- diff(log_p0_sa_tr)
+d1_log_p1_sa_tr <- diff(log_p1_sa_tr)
+
+y_d1_sa <- cbind(d1_log_p0_sa_tr, d1_log_p1_sa_tr)
+colnames(y_d1_sa) <- c("d1_log_p0_sa", "d1_log_p1_sa")
+
+# Pulses aligned with differenced series (same idea as X_p_tr_d1)
+X_pulses_tr      <- X_pulses[train_mask, , drop = FALSE]
+X_p_tr_d1        <- X_pulses_tr[-1, , drop = FALSE]   # drop first obs for Δ
+
+# Lag selection without seasonal dummies
+lag_sel_d1_sa <- VARselect(y_d1_sa, lag.max = 4,
+                           type   = "both",
+                           exogen = X_p_tr_d1)
+lag_sel_d1_sa$selection
+p_d1_sa <- as.integer(lag_sel_d1_sa$selection["AIC(n)"])
+
+var_d1_sa <- VAR(
+  y_d1_sa,
+  p      = p_d1_sa,
+  type   = "both",
+  exogen = X_p_tr_d1
+)
+summary(var_d1_sa)
+
+# Diagnostics
+serial.test(var_d1_sa, lags.pt = 8, type = "PT.asymptotic")
+arch.test(var_d1_sa, lags.multi = 4)
+normality.test(var_d1_sa)
+
+plot(resid(var_d1_sa), main = "VAR(Δ log, STL-adjusted) residuals")
+
+
+
+```
+
+```{r}
+
+############################################################
+# 10. Out-of-sample forecasting (train-only estimation)
+############################################################
+
+# 10.1 Build full-sample differenced series ----------------
+
+# First differences of logs for the whole sample
+d1_log_p0_all <- diff(log_p0)
+d1_log_p1_all <- diff(log_p1)
+y_d1_all <- cbind(d1_log_p0_all, d1_log_p1_all)
+colnames(y_d1_all) <- c("d1_log_p0", "d1_log_p1")
+
+# Seasonal (lag‑4) differences of logs for the whole sample
+d4_log_p0_all <- diff(log_p0, lag = 4)
+d4_log_p1_all <- diff(log_p1, lag = 4)
+y_d4_all <- cbind(d4_log_p0_all, d4_log_p1_all)
+colnames(y_d4_all) <- c("d4_log_p0", "d4_log_p1")
+
+# 10.2 Extract TEST parts of differenced series ------------
+# Test sample starts at 2024Q1 (consistent with y_test above)
+y_d1_test <- window(y_d1_all, start = c(2024, 1))  # Δlog test
+y_d4_test <- window(y_d4_all, start = c(2024, 1))  # Δ4log test
+
+h_d1 <- if (length(y_d1_test) == 0) 0 else nrow(as.matrix(y_d1_test))
+h_d4 <- if (length(y_d4_test) == 0) 0 else nrow(as.matrix(y_d4_test))
+
+cat("Horizon: Model A (Δlog) =", h_d1,
+    "quarters; Model B (Δ4log) =", h_d4, "quarters\n")
+
+# 10.3 Exogenous matrices for forecast horizon -------------
+
+# Seasonal dummies and pulses for TEST in levels
+S_test        <- season_full[test_mask, , drop = FALSE]
+X_pulses_test <- X_pulses[test_mask, , drop = FALSE]
+
+# For Model A (Δlog), estimation used X_d1 = cbind(S_tr_d1, X_p_tr_d1).
+# For forecasting, use the same columns for the test horizon.
+if (h_d1 > 0) {
+  X_d1_fore <- cbind(S_test, X_pulses_test)
+  
+  # keep only the columns that were used in estimation, in the same order
+  X_d1_fore <- X_d1_fore[seq_len(h_d1), colnames(X_d1), drop = FALSE]
+}
+
+# For Model B (Δ4log), only the pulse dummies are used as exogenous (X_p_d4).
+# Build a pulse matrix for the y_d4_test time index and match colnames(X_p_d4).
+if (h_d4 > 0) {
+  t_test_d4 <- time(y_d4_test)
+  
+  X_p_d4_test <- cbind(
+    covid_q2     = as.numeric(t_test_d4 == (2020 + 1/4)),
+    covid_q3     = as.numeric(t_test_d4 == (2020 + 2/4)),
+    shock_2022q2 = as.numeric(t_test_d4 == (2022 + 1/4))
+  )
+  
+  # Ensure same column ordering as in estimation
+  X_p_d4_test <- X_p_d4_test[, colnames(X_p_d4), drop = FALSE]
+}
+
+# 10.4 Model A: VAR in Δlog --------------------------------
+
+if (h_d1 > 0) {
+  
+  predA <- predict(var_d1, n.ahead = h_d1, dumvar = X_d1_fore)
+  
+  fc_d1_p0 <- as.numeric(predA$fcst[["d1_log_p0"]][, "fcst"])
+  fc_d1_p1 <- as.numeric(predA$fcst[["d1_log_p1"]][, "fcst"])
+  
+  fc_d1_p0_ts <- ts(fc_d1_p0, start = start(y_d1_test), frequency = 4)
+  fc_d1_p1_ts <- ts(fc_d1_p1, start = start(y_d1_test), frequency = 4)
+  
+  par(mfrow = c(2,1))
+  ts.plot(y_d1_test[, "d1_log_p0"], fc_d1_p0_ts,
+          col = c("black","red"), lty = c(1,2),
+          main = "Model A: Δlog(p0) actual vs forecast",
+          ylab = "Δlog p0")
+  legend("topleft", c("actual","forecast"),
+         col = c("black","red"), lty = c(1,2), bty = "n")
+  
+  ts.plot(y_d1_test[, "d1_log_p1"], fc_d1_p1_ts,
+          col = c("black","blue"), lty = c(1,2),
+          main = "Model A: Δlog(p1) actual vs forecast",
+          ylab = "Δlog p1")
+  legend("topleft", c("actual","forecast"),
+         col = c("black","blue"), lty = c(1,2), bty = "n")
+  par(mfrow = c(1,1))
+  
+  cat("\nModel A (Δlog) accuracy:\n")
+  print(safe_accuracy(fc_d1_p0_ts, y_d1_test[, "d1_log_p0"]))
+  print(safe_accuracy(fc_d1_p1_ts, y_d1_test[, "d1_log_p1"]))
+  
+  # Reconstruct log-level forecasts by cumulating Δlog
+  last_log_p0 <- tail(window(log_p0, end = cut_year), 1)
+  last_log_p1 <- tail(window(log_p1, end = cut_year), 1)
+  
+  log_p0_fc_A <- ts(cumsum(c(last_log_p0, fc_d1_p0))[-1],
+                    start = start(y_d1_test), frequency = 4)
+  log_p1_fc_A <- ts(cumsum(c(last_log_p1, fc_d1_p1))[-1],
+                    start = start(y_d1_test), frequency = 4)
+  
+  if (!is.null(y_test) && length(y_test) > 0) {
+    par(mfrow = c(2,1))
+    ts.plot(y_test[, "log_p0"], log_p0_fc_A,
+            col = c("black","red"), lty = c(1,2),
+            main = "Model A: log p0 actual vs forecast",
+            ylab = "log p0")
+    legend("topleft", c("actual","forecast"),
+           col = c("black","red"), lty = c(1,2), bty = "n")
+    
+    ts.plot(y_test[, "log_p1"], log_p1_fc_A,
+            col = c("black","blue"), lty = c(1,2),
+            main = "Model A: log p1 actual vs forecast",
+            ylab = "log p1")
+    legend("topleft", c("actual","forecast"),
+           col = c("black","blue"), lty = c(1,2), bty = "n")
+    par(mfrow = c(1,1))
+  }
+  
+} else {
+  cat("No Δlog test observations; skipping Model A.\n")
+}
+
+# 10.5 Model B: VAR in Δ4log -------------------------------
+
+if (h_d4 > 0) {
+  
+  predB <- predict(var_d4, n.ahead = h_d4, dumvar = X_p_d4_test)
+  
+  fc_d4_p0 <- as.numeric(predB$fcst[["d4_log_p0"]][, "fcst"])
+  fc_d4_p1 <- as.numeric(predB$fcst[["d4_log_p1"]][, "fcst"])
+  
+  fc_d4_p0_ts <- ts(fc_d4_p0, start = start(y_d4_test), frequency = 4)
+  fc_d4_p1_ts <- ts(fc_d4_p1, start = start(y_d4_test), frequency = 4)
+  
+  par(mfrow = c(2,1))
+  ts.plot(y_d4_test[, "d4_log_p0"], fc_d4_p0_ts,
+          col = c("black","red"), lty = c(1,2),
+          main = "Model B: Δ4log(p0) actual vs forecast",
+          ylab = "Δ4log p0")
+  legend("topleft", c("actual","forecast"),
+         col = c("black","red"), lty = c(1,2), bty = "n")
+  
+  ts.plot(y_d4_test[, "d4_log_p1"], fc_d4_p1_ts,
+          col = c("black","blue"), lty = c(1,2),
+          main = "Model B: Δ4log(p1) actual vs forecast",
+          ylab = "Δ4log p1")
+  legend("topleft", c("actual","forecast"),
+         col = c("black","blue"), lty = c(1,2), bty = "n")
+  par(mfrow = c(1,1))
+  
+  cat("\nModel B (Δ4log) accuracy:\n")
+  print(safe_accuracy(fc_d4_p0_ts, y_d4_test[, "d4_log_p0"]))
+  print(safe_accuracy(fc_d4_p1_ts, y_d4_test[, "d4_log_p1"]))
+  
+  # Reconstruct log levels from Δ4log using last 4 in-sample logs
+  last4_log_p0 <- as.numeric(tail(window(log_p0, end = cut_year), 4))
+  last4_log_p1 <- as.numeric(tail(window(log_p1, end = cut_year), 4))
+  
+  buf_p0 <- c(last4_log_p0, rep(NA_real_, h_d4))
+  buf_p1 <- c(last4_log_p1, rep(NA_real_, h_d4))
+  
+  for (i in seq_len(h_d4)) {
+    buf_p0[4 + i] <- fc_d4_p0[i] + buf_p0[i]
+    buf_p1[4 + i] <- fc_d4_p1[i] + buf_p1[i]
+  }
+  
+  log_p0_fc_B <- ts(buf_p0[5:(4 + h_d4)],
+                    start = start(y_d4_test), frequency = 4)
+  log_p1_fc_B <- ts(buf_p1[5:(4 + h_d4)],
+                    start = start(y_d4_test), frequency = 4)
+  
+  if (!is.null(y_test) && length(y_test) > 0) {
+    par(mfrow = c(2,1))
+    ts.plot(y_test[, "log_p0"], log_p0_fc_B,
+            col = c("black","red"), lty = c(1,2),
+            main = "Model B: log p0 actual vs forecast",
+            ylab = "log p0")
+    legend("topleft", c("actual","forecast"),
+           col = c("black","red"), lty = c(1,2), bty = "n")
+    
+    ts.plot(y_test[, "log_p1"], log_p1_fc_B,
+            col = c("black","blue"), lty = c(1,2),
+            main = "Model B: log p1 actual vs forecast",
+            ylab = "log p1")
+    legend("topleft", c("actual","forecast"),
+           col = c("black","blue"), lty = c(1,2), bty = "n")
+    par(mfrow = c(1,1))
+  }
+  
+} else {
+  cat("No Δ4log test observations; skipping Model B.\n")
+}
+
+cat("\nSection 10 complete: forecasts produced from models estimated on training data only.\n")
+
+
+
+#transform
+
+## ---- Model A: transform log forecasts back to levels ----
+# Actual GDP levels for the test period
+p0_test_A <- window(ts_p0,
+                    start = start(log_p0_fc_A),
+                    end   = end(log_p0_fc_A))
+p1_test_A <- window(ts_p1,
+                    start = start(log_p1_fc_A),
+                    end   = end(log_p1_fc_A))
+
+# Forecasted levels (invert logs)
+p0_fc_A <- ts(exp(log_p0_fc_A),
+              start = start(log_p0_fc_A),
+              frequency = 4)
+p1_fc_A <- ts(exp(log_p1_fc_A),
+              start = start(log_p1_fc_A),
+              frequency = 4)
+
+# Plot level actual vs forecast (Model A)
+par(mfrow = c(2,1))
+ts.plot(p0_test_A, p0_fc_A,
+        col = c("black", "red"), lty = c(1, 2),
+        main = "Model A: GDP (p0) – level actual vs forecast",
+        ylab = "GDP level (p0)")
+legend("topleft", c("actual", "forecast"),
+       col = c("black", "red"), lty = c(1, 2), bty = "n")
+
+ts.plot(p1_test_A, p1_fc_A,
+        col = c("black", "blue"), lty = c(1, 2),
+        main = "Model A: Agriculture GDP (p1) – level actual vs forecast",
+        ylab = "GDP level (p1)")
+legend("topleft", c("actual", "forecast"),
+       col = c("black", "blue"), lty = c(1, 2), bty = "n")
+par(mfrow = c(1,1))
+
+# Optional: accuracy in levels
+cat("\nModel A (LEVELS) accuracy:\n")
+cat("p0:\n")
+print(safe_accuracy(p0_fc_A, p0_test_A))
+cat("p1:\n")
+print(safe_accuracy(p1_fc_A, p1_test_A))
+
+
+## ---- Model B: transform log forecasts back to levels ----
+# Actual GDP levels for the test period
+p0_test_B <- window(ts_p0,
+                    start = start(log_p0_fc_B),
+                    end   = end(log_p0_fc_B))
+p1_test_B <- window(ts_p1,
+                    start = start(log_p1_fc_B),
+                    end   = end(log_p1_fc_B))
+
+# Forecasted levels (invert logs)
+p0_fc_B <- ts(exp(log_p0_fc_B),
+              start = start(log_p0_fc_B),
+              frequency = 4)
+p1_fc_B <- ts(exp(log_p1_fc_B),
+              start = start(log_p1_fc_B),
+              frequency = 4)
+
+# Plot level actual vs forecast (Model B)
+par(mfrow = c(2,1))
+ts.plot(p0_test_B, p0_fc_B,
+        col = c("black", "red"), lty = c(1, 2),
+        main = "Model B: GDP (p0) – level actual vs forecast",
+        ylab = "GDP level (p0)")
+legend("topleft", c("actual", "forecast"),
+       col = c("black", "red"), lty = c(1, 2), bty = "n")
+
+ts.plot(p1_test_B, p1_fc_B,
+        col = c("black", "blue"), lty = c(1, 2),
+        main = "Model B: Agriculture GDP (p1) – level actual vs forecast",
+        ylab = "GDP level (p1)")
+legend("topleft", c("actual", "forecast"),
+       col = c("black", "blue"), lty = c(1, 2), bty = "n")
+par(mfrow = c(1,1))
+
+# Optional: accuracy in levels
+cat("\nModel B (LEVELS) accuracy:\n")
+cat("p0:\n")
+print(safe_accuracy(p0_fc_B, p0_test_B))
+cat("p1:\n")
+print(safe_accuracy(p1_fc_B, p1_test_B))
+
+```
+Seasonally adjusted 
+```{r}
+# TEST Δlog SA series for horizon length (optional)
+# You can also simply set h_d1_sa <- nrow(y_d1_test)
+h_d1_sa <- h_d1
+
+# Build exogenous pulses for TEST horizon (same columns as X_p_tr_d1)
+X_pulses_test <- X_pulses[test_mask, , drop = FALSE]
+X_p_d1_sa_fore <- X_pulses_test[seq_len(h_d1_sa), colnames(X_p_tr_d1), drop = FALSE]
+
+predC <- predict(var_d1_sa, n.ahead = h_d1_sa, dumvar = X_p_d1_sa_fore)
+
+fc_d1_p0_sa <- as.numeric(predC$fcst[["d1_log_p0_sa"]][, "fcst"])
+fc_d1_p1_sa <- as.numeric(predC$fcst[["d1_log_p1_sa"]][, "fcst"])
+
+fc_d1_p0_sa_ts <- ts(fc_d1_p0_sa, start = start(y_d1_test), frequency = 4)
+fc_d1_p1_sa_ts <- ts(fc_d1_p1_sa, start = start(y_d1_test), frequency = 4)
+
+
+# last in-sample SA log values (at 2023Q4)
+last_log_p0_sa <- tail(log_p0_sa_tr, 1)
+last_log_p1_sa <- tail(log_p1_sa_tr, 1)
+
+log_p0_sa_fc <- ts(cumsum(c(last_log_p0_sa, fc_d1_p0_sa))[-1],
+                   start = start(y_d1_test), frequency = 4)
+log_p1_sa_fc <- ts(cumsum(c(last_log_p1_sa, fc_d1_p1_sa))[-1],
+                   start = start(y_d1_test), frequency = 4)
+
+# Extract quarterly seasonal pattern from training STL
+season_p0_tr <- log_p0_stl$time.series[, "seasonal"]
+season_p1_tr <- log_p1_stl$time.series[, "seasonal"]
+
+# Average seasonal component by quarter (cycle = 1..4)
+pattern_p0 <- tapply(season_p0_tr, cycle(log_p0_tr), mean)
+pattern_p1 <- tapply(season_p1_tr, cycle(log_p1_tr), mean)
+
+# Build seasonal factors for the forecast horizon
+q_idx_fc <- cycle(ts_p0)[time(ts_p0) >= 2024 + 0/4]  # quarters for test period
+season_p0_fc <- ts(pattern_p0[q_idx_fc],
+                   start = start(y_d1_test), frequency = 4)
+season_p1_fc <- ts(pattern_p1[q_idx_fc],
+                   start = start(y_d1_test), frequency = 4)
+
+# Full log forecasts = SA log + seasonal component
+log_p0_fc_C <- log_p0_sa_fc + season_p0_fc
+log_p1_fc_C <- log_p1_sa_fc + season_p1_fc
+
+p0_fc_C <- ts(exp(log_p0_fc_C),
+              start = start(log_p0_fc_C), frequency = 4)
+p1_fc_C <- ts(exp(log_p1_fc_C),
+              start = start(log_p1_fc_C), frequency = 4)
+
+p0_test_C <- window(ts_p0,
+                    start = start(p0_fc_C),
+                    end   = end(p0_fc_C))
+p1_test_C <- window(ts_p1,
+                    start = start(p1_fc_C),
+                    end   = end(p1_fc_C))
+
+par(mfrow = c(2,1))
+ts.plot(p0_test_C, p0_fc_C,
+        col = c("black","red"), lty = c(1,2),
+        main = "Model C (STL-VAR): p0 level actual vs forecast")
+legend("topleft", c("actual","forecast"), col = c("black","red"),
+       lty = c(1,2), bty = "n")
+
+ts.plot(p1_test_C, p1_fc_C,
+        col = c("black","blue"), lty = c(1,2),
+        main = "Model C (STL-VAR): p1 level actual vs forecast")
+legend("topleft", c("actual","forecast"), col = c("black","blue"),
+       lty = c(1,2), bty = "n")
+par(mfrow = c(1,1))
+
+cat("\nModel C (STL-adjusted, LEVELS) accuracy:\n")
+cat("p0:\n"); print(safe_accuracy(p0_fc_C, p0_test_C))
+cat("p1:\n"); print(safe_accuracy(p1_fc_C, p1_test_C))
+
+```
+
+
+# You can then reconstruct level forecasts if needed by summing back Δ4 logs,
+# or just evaluate forecast accuracy on Δ4 logs if you transform the test data.
+
+```{r}
+###########################################################
+# 11. IRF and FEVD – effect of agriculture (p1) on GDP (p0)
+############################################################
+
+# We work with the stationary VARs:
+#   Model A: var_d1 (Δlog)
+#   Model B: var_d4 (Δ4log)
+
+############################################################
+# 11A. IRF: shock to agriculture and response of GDP
+############################################################
+
+# Model A: impulse = Δlog_p1, response = Δlog_p0
+irf_A_p1_to_p0 <- irf(
+  var_d1,
+  impulse  = "d1_log_p1",
+  response = "d1_log_p0",
+  n.ahead  = 12,      # horizons (quarters) – change if you want
+  boot     = TRUE
+)
+
+# Model B: impulse = Δ4log_p1, response = Δ4log_p0
+irf_B_p1_to_p0 <- irf(
+  var_d4,
+  impulse  = "d4_log_p1",
+  response = "d4_log_p0",
+  n.ahead  = 12,
+  boot     = TRUE
+)
+
+# Plot IRFs
+par(mfrow = c(1, 2))
+plot(irf_A_p1_to_p0, main = "IRF (Model A): shock to Δlog(p1) on Δlog(p0)")
+plot(irf_B_p1_to_p0, main = "IRF (Model B): shock to Δ4log(p1) on Δ4log(p0)")
+par(mfrow = c(1, 1))
+
+
+############################################################
+# 11B. FEVD: share of p0 forecast variance explained by p1
+############################################################
+
+# Model A FEVD
+fevd_A <- fevd(var_d1, n.ahead = 12)
+# This is a list; the component for the p0 equation is:
+#   fevd_A$d1_log_p0  (rows = horizons, cols = variables)
+
+fevd_A_p0 <- fevd_A$d1_log_p0  # matrix: horizon × {d1_log_p0, d1_log_p1}
+
+# Model B FEVD
+fevd_B <- fevd(var_d4, n.ahead = 12)
+fevd_B_p0 <- fevd_B$d4_log_p0  # horizon × {d4_log_p0, d4_log_p1}
+
+# Simple plots of FEVD contributions of p1 to p0
+par(mfrow = c(1, 2))
+plot(1:12, fevd_A_p0[, "d1_log_p1"] * 100, type = "b",
+     xlab = "Horizon (quarters)", ylab = "% variance",
+     main = "FEVD (Model A): share of Δlog(p0) due to Δlog(p1)")
+plot(1:12, fevd_B_p0[, "d4_log_p1"] * 100, type = "b",
+     xlab = "Horizon (quarters)", ylab = "% variance",
+     main = "FEVD (Model B): share of Δ4log(p0) due to Δ4log(p1)")
+par(mfrow = c(1, 1))
+
+# Optional: nice tables for thesis
+fevd_table_A <- tibble(
+  horizon = 1:12,
+  `own shock (p0)` = fevd_A_p0[, "d1_log_p0"] * 100,
+  `agri shock (p1)` = fevd_A_p0[, "d1_log_p1"] * 100
+)
+
+fevd_table_B <- tibble(
+  horizon = 1:12,
+  `own shock (p0)` = fevd_B_p0[, "d4_log_p0"] * 100,
+  `agri shock (p1)` = fevd_B_p0[, "d4_log_p1"] * 100
+)
+
+kable(fevd_table_A, digits = 2,
+      caption = "FEVD – Model A: percentage of Δlog(p0) variance explained by own vs agriculture shocks")
+kable(fevd_table_B, digits = 2,
+      caption = "FEVD – Model B: percentage of Δ4log(p0) variance explained by own vs agriculture shocks")
+
+
+```
+############################################################
+# END OF SCRIPT
+############################################################
+
+#New need to rerun gpt explanation
+
+```{r}
+
+res_d1 <- resid(var_d1)
+par(mfrow = c(2, 1))
+acf(res_d1[, "d1_log_p0"], main = "ACF residuals Δlog_p0 (Model A)")
+acf(res_d1[, "d1_log_p1"], main = "ACF residuals Δlog_p1 (Model A)")
+
+res_d4 <- resid(var_d4)
+par(mfrow = c(2, 1))
+acf(res_d4[, "d4_log_p0"], main = "ACF residuals Δ4log_p0 (Model B)")
+acf(res_d4[, "d4_log_p1"], main = "ACF residuals Δ4log_p1 (Model B)")
+par(mfrow = c(1, 1))
+
+serial.test(var_d1, type = "BG", lags.bg = 4)
+serial.test(var_d4, type = "BG", lags.bg = 4)
+
+library(vars)
+roots(var_d1)   # var_model is the output from VAR()
+roots(var_d4)   # var_model is the output from VAR()
+
+# For Model A, training period:
+d1_log_p0_tr <- diff(log_p0_tr)
+S_tr_d1      <- S_train[-1, , drop = FALSE]  # same alignment as in your VAR
+
+# Remove seasonal dummies from the differenced series
+lm_d1_p0     <- lm(d1_log_p0_tr ~ S_tr_d1)
+res_d1_p0    <- resid(lm_d1_p0)
+
+adf.test(res_d1_p0, k = adf_k(res_d1_p0))
+kpss.test(res_d1_p0, null = "Level")
+```
+
+```{r}
+# Combined differencing: First difference and Seasonal difference (lag = 4)
+d1_log_p0_tr <- diff(log_p0_tr, lag = 1)  # First differencing
+d1_log_p1_tr <- diff(log_p1_tr, lag = 1)
+
+d4_log_p0_tr <- diff(log_p0_tr, lag = 4)  # Seasonal differencing (lag 4)
+d4_log_p1_tr <- diff(log_p1_tr, lag = 4)
+
+# Now combine first and seasonal differencing
+# For example, we combine first and seasonal differencing by adding them together or using the seasonal difference first
+# Here I'll assume you prefer seasonal differencing first
+#combined_diffs_p0 <- d4_log_p0_tr  # Use seasonal diff first
+#combined_diffs_p1 <- d4_log_p1_tr  # Use seasonal diff first
+
+# Optionally, you can use first differencing on top of seasonal differencing:
+ combined_diffs_p0 <- diff(d4_log_p0_tr, lag = 1)  # If you want first difference after seasonal differencing
+ combined_diffs_p1 <- diff(d4_log_p1_tr, lag = 1)
+
+# Bind the differenced series for VAR model
+y_combined <- cbind(combined_diffs_p0, combined_diffs_p1)
+colnames(y_combined) <- c("d4_log_p0_combined", "d4_log_p1_combined")
+
+# Specify exogenous variables (if any, otherwise leave as NULL)
+X_dummies <- X_pulses[train_mask, , drop = FALSE]  # Example for exogenous variables
+
+# Lag selection for VAR model based on AIC, BIC, etc.
+lag_selection <- VARselect(y_combined, lag.max = 4, type = "const")
+best_lag <- as.integer(lag_selection$selection["AIC(n)"])
+
+# Fit the VAR model with the selected lags and exogenous variables
+var_model <- VAR(
+  y_combined, 
+  p = best_lag, 
+  type = "const",  # Include trend if needed
+  # Include exogenous variables if applicable
+)
+
+# Summary of the VAR model
+summary(var_model)
+
+# Residual diagnostics
+serial.test(var_model, lags.pt = 8, type = "PT.asymptotic")  # Portmanteau test
+arch.test(var_model, lags.multi = 4)  # ARCH test
+normality.test(var_model)  # Normality test
+
+# Plot the residuals for diagnostic purposes
+plot(resid(var_model), main = "Residuals of VAR Model with Combined Differencing")
+
+```
+

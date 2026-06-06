@@ -1,0 +1,349 @@
+```{r}
+# =========================
+# Libraries & helpers
+# =========================
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lubridate)
+  library(forecast)
+  library(tseries)
+  library(ggplot2)
+  library(vars)
+  library(urca)
+})
+
+safe_accuracy <- function(fc, ytest) {
+  A <- accuracy(fc, ytest)
+  A[, intersect(c("ME","RMSE","MAE","MPE","MAPE","MASE","ACF1","Theil's U"),
+                colnames(A)), drop = FALSE]
+}
+
+adf_k <- function(x) trunc((length(na.omit(x)) - 1)^(1/3))
+
+```
+2. Load data & build ts objects
+```{r}
+# =========================
+# Load & clean data
+# =========================
+output_directory <- "C:/nottingham 25-26/Math Group Project/CW2 - AGRICULTURE"
+file_name <- "original.csv"
+full_input_path <- paste0(output_directory, "/", file_name)
+
+df <- read_csv(full_input_path) 
+# , stringsAsFactors = FALSE
+
+norm_str <- function(x) tolower(trimws(as.character(x)))
+df <- df %>%
+  mutate(
+    series = norm_str(series),
+    sector = norm_str(sector),
+    value  = as.numeric(gsub(",", "", as.character(value)))
+  )
+
+d0 <- suppressWarnings(dmy(df$date))
+d1 <- suppressWarnings(ymd(df$date))
+d2 <- suppressWarnings(mdy(df$date))
+df$date <- coalesce(d0, d1, d2)
+stopifnot(!all(is.na(df$date)))
+
+abs_df <- df %>%
+  filter(series == "abs", !is.na(value)) %>%
+  arrange(date)
+
+# =========================
+# Build quarterly ts for p0, p1, share
+# =========================
+gdp  <- abs_df %>%
+  dplyr::filter(sector %in% c("p0","gdp","gross domestic product","jumlah","kdnk")) %>%
+  dplyr::arrange(date) %>%
+  dplyr::select(date, p0 = value)
+
+agri <- abs_df %>%
+  dplyr::filter(sector %in% c("p1","agriculture","agriculture, forestry & fishing","pertanian")) %>%
+  dplyr::arrange(date) %>%
+  dplyr::select(date, p1 = value)
+dat <- inner_join(gdp, agri, by = "date") %>%
+  arrange(date)
+
+ts_p0 <- ts(dat$p0,
+            start = c(year(min(dat$date)), quarter(min(dat$date))),
+            frequency = 4)
+ts_p1 <- ts(dat$p1, start = start(ts_p0), frequency = 4)
+ts_share <- ts(100 * dat$p1 / dat$p0,
+               start = start(ts_p0), frequency = 4)
+
+tq <- time(ts_p0)
+
+```
+3. Trend + seasonality + pulses (same for VAR and Johansen)
+```{r}
+# =========================
+# Deterministic terms (trend, season, pulses)
+# =========================
+
+# linear time trend
+trend_full <- 1:length(ts_p0)
+
+# quarterly seasonal dummies (3 cols)
+season_full <- seasonaldummy(ts_p0)   # uses ts frequency = 4
+
+# pulses
+X_pulses <- cbind(
+  covid_q2     = as.numeric(tq == 2020 + 1/4),
+  covid_q3     = as.numeric(tq == 2020 + 2/4),
+  shock_2022q2 = as.numeric(tq == 2022 + 1/4)
+)
+
+# combine all exogenous deterministics
+exog_full <- cbind(trend = trend_full,
+                   season_full,
+                   X_pulses)
+
+# logs for cointegration
+log_p0 <- log(ts_p0)
+log_p1 <- log(ts_p1)
+
+y_levels <- cbind(log_p0, log_p1)
+colnames(y_levels) <- c("log_p0", "log_p1")
+
+```
+4. Train / test split (same cut you’ve been using)
+```{r}
+# =========================
+# Train / test split
+# Train: up to 2023Q4
+# Test : 2024Q1–2025Q4
+# =========================
+cut_year <- c(2023, 4)
+cut_time <- 2023 + 3/4
+
+y_train <- window(y_levels, end   = cut_year)
+y_test  <- window(y_levels, start = c(2024, 1))
+
+train_mask <- (time(ts_p0) <= cut_time)
+test_mask  <- !train_mask
+
+exog_train <- exog_full[train_mask, , drop = FALSE]
+exog_test  <- exog_full[test_mask,  , drop = FALSE]
+
+stopifnot(nrow(y_train) == nrow(exog_train))
+
+```
+
+5. Choose lag order on levels (with trend+season+pulses)
+```{r}
+# =========================
+# VAR lag selection on TRAIN (levels)
+# =========================
+lag_sel <- VARselect(y_train,
+                     lag.max = 4,
+                     type    = "const",      # intercept in each eq.
+                     exogen  = exog_train)   # trend + season + pulses
+
+print(lag_sel$selection)
+p_opt <- lag_sel$selection["AIC(n)"]   # or "SC(n)" for BIC choice
+
+```
+6. Johansen cointegration test (decide VAR vs VECM)
+```{r}
+# =========================
+# Johansen cointegration test (TRAIN, levels)
+# =========================
+jo_tr <- ca.jo(y_train,
+               type   = "trace",
+               ecdet  = "const",    # constant in cointegration relation
+               K      = 2,          # outputn for lagmax 4 =1 
+               dumvar = exog_train) # SAME deterministics as above
+
+summary(jo_tr)
+
+
+# Quick decision at 5% level
+jo_sum <- summary(jo_tr)
+teststat <- jo_sum@teststat
+critvals <- jo_sum@cval[,"5pct"]
+
+stat_r0   <- teststat["r = 0"]
+crit_r0   <- critvals["r = 0"]
+stat_rle1 <- teststat["r <= 1"]
+crit_rle1 <- critvals["r <= 1"]
+
+
+
+```
+
+trend test
+```{r}
+
+t <- 1:length(log_p0)
+
+summary(lm(log_p0 ~ t))
+summary(lm(log_p1 ~ t))
+
+```
+
+
+Less XReg
+```{r}
+# Logs: levels
+adf_logp0_lvl    <- adf.test(log_p0,    k = adf_k(log_p0))
+adf_logp1_lvl    <- adf.test(log_p1,    k = adf_k(log_p1))
+
+adf_logp0_lvl
+adf_logp1_lvl
+
+S_train  <- season_full[train_mask, , drop = FALSE]
+
+
+p_opt <- VARselect(y_train, lag.max = 4, type="trend")$selection["AIC(n)"]
+summary(p_opt)
+K_joh <- max(2, p_opt + 1)
+
+S_train  <- season_full[train_mask, , drop = FALSE]
+
+trend_joh <- ca.jo(
+  y_train,
+  type   = "trace",
+  ecdet  = "trend",  # constant in cointegration space
+  K      = K_joh,
+  dumvar = S_train   # ONLY seasonal dummies
+)
+
+summary(trend_joh)
+
+
+```
+Johansen Result:
+Trace test suggests 1 cointegration vector (r = 1).
+
+However, this test is known to be unreliable in small samples (T ≈ 40) and
+in the presence of strong deterministic trends and structural breaks (e.g.,
+COVID-19). Therefore, the long-run vector must be validated using the
+Engle–Granger residual test.
+Cointegration Residual Test
+```{r}
+
+trend_vec <- 1:nrow(y_train)
+trend_ts <- ts(1:nrow(y_train), start=start(y_train), frequency=4)
+Y_aug <- cbind(
+  log_p0 = y_train[,1],
+  log_p1 = y_train[,2],
+  trend  = trend_ts
+)
+
+beta <- trend_joh@V[,1]    # first cointegration vector
+ect  <- Y_aug %*% beta      # NOW dimensions match
+ect  <- ts(ect, start=start(y_train), freq=4)
+
+
+autoplot(ect) +
+  ggtitle("Cointegration Residual (EC term)") +
+  theme_minimal()
+
+adf.test(ect)
+
+t_res <- 1:length(ect)
+summary(lm(as.numeric(ect) ~ t_res))
+```
+
+
+## 4.0 Testing for Cointegration Between GDP (p0) and Agriculture GDP (p1)
+
+This section evaluates whether total GDP (p0) and agriculture GDP (p1) share a
+long-run equilibrium relationship. If the two series are cointegrated, a Vector
+Error Correction Model (VECM) is required. If not, a standard Vector
+Autoregression (VAR) in differences is the appropriate model.
+
+We use:
+- **Logs of p0 and p1**
+- **Seasonal dummies**
+- **Train sample only: 2015Q1–2023Q4**
+
+Intervention dummies (COVID-19 and 2022 shocks) are *not included* in the
+cointegration test because the Johansen procedure assumes no large structural
+breaks.
+
+---
+
+### 4.1 Step 1 — Stationarity Checks (ADF)
+
+```
+library(tseries)
+
+adf_logp0 <- adf.test(log_p0)
+adf_logp1 <- adf.test(log_p1)
+
+adf_logp0_sdiff <- adf.test(diff(log_p0, lag = 4))
+adf_logp1_sdiff <- adf.test(diff(log_p1, lag = 4))
+
+adf_logp0
+adf_logp1
+adf_logp0_sdiff
+adf_logp1_sdiff
+```
+
+
+❌ Your cointegration vector IS NOT stationary
+
+→ NO COINTEGRATION
+→ You should NOT use a VECM
+→ Use VAR (in seasonal differences) instead.
+
+✅ 1. ADF Test on ECT (MUST be stationary)
+ADF = -1.7168  
+p-value = 0.6833  
+
+That means:
+
+❌ Fail to reject H₀ (nonstationary)
+
+The EC term has a unit root.
+📌 If ECT is nonstationary → NO valid cointegration relationship → VECM is invalid.
+
+
+
+✅ 2. Trend regression on ECT
+
+Results:
+
+Trend coefficient p = 0.28 → not significant
+BUT the residual still has variance = 0.072, quite large
+No visible mean-reversion pattern
+
+This implies:
+No trending behavior (good)
+But ECT does not revert to a long-run equilibrium (bad)
+
+A valid cointegration residual should oscillate tightly around 0, not drift around 14.8–15.1 with huge COVID shock dips.
+
+
+✅ 3. Visual inspection (your plot)
+
+Your EC-term:
+
+Looks nonstationary
+Shows persistent shifts
+COVID shock creates random walk-type behavior
+No strong pullback to any equilibrium line
+
+
+4.5 Why Johansen Gives a False Positive
+
+Although Johansen indicated r = 1, this is a known problem in small samples:
+
+Both series contain strong linear trends
+
+Sample size is very small (n ≈ 40)
+
+There are large structural breaks (COVID-19)
+
+Johansen is highly sensitive to lag selection
+
+These issues inflate the trace statistic, causing false detection of
+cointegration.
+
+The Engle–Granger test correctly identifies no cointegration.
+
+
+

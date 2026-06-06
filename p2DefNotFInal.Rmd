@@ -1,0 +1,1109 @@
+---
+title: "p2finalmaybe"
+author: "Leong Jun Chuen"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## R Markdown
+
+```{r}
+# ---- Libraries ----
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lubridate)
+  library(forecast)
+  library(tseries)
+  library(ggplot2)
+})
+
+# ---- Helpers ----
+safe_accuracy <- function(fc, ytest) {
+  A <- accuracy(fc, ytest)
+  A[, intersect(c("ME","RMSE","MAE","MPE","MAPE","MASE","ACF1","Theil's U"),
+                colnames(A)), drop = FALSE]
+}
+lb_p <- function(fit, y, lag = 8) {
+  k <- length(coef(fit)); if (is.null(k)) k <- 0
+  Box.test(residuals(fit), type = "Ljung-Box",
+           lag = min(lag, length(y)-1), fitdf = k)$p.value
+}
+get_AICc <- function(fit) {  # robust AICc
+  if (!is.null(fit$aicc)) return(fit$aicc)
+  aic <- AIC(fit); n <- length(residuals(fit)); k <- length(coef(fit))
+  if (is.finite(n) && is.finite(k) && (n > k + 1))
+    aic + (2 * k * (k + 1)) / (n - k - 1) else aic
+}
+plot_backtest <- function(ts_full, fc, start_yq, title) {
+  n  <- length(ts_full)
+  f  <- frequency(ts_full)
+  st <- start(ts_full)
+  all_t <- st[1] + (0:(n-1) + st[2]-1)/f
+  # quick quarterly date index
+  q_to_month <- function(q) c(1,4,7,10)[q]
+  yy <- floor(all_t)
+  qq <- (round((all_t - yy)*f) %% f) + 1
+  dates <- as.Date(sprintf("%04d-%02d-01", yy, q_to_month(qq)))
+  
+  test <- window(ts_full, start = start_yq)
+  idx  <- (n - length(test) + 1):n
+  
+  df <- tibble(
+    date  = dates[idx],
+    actual= as.numeric(test),
+    mean  = as.numeric(fc$mean),
+    lo80  = as.numeric(fc$lower[,"80%"]), hi80 = as.numeric(fc$upper[,"80%"]),
+    lo95  = as.numeric(fc$lower[,"95%"]), hi95 = as.numeric(fc$upper[,"95%"])
+  )
+  
+  ggplot(df, aes(date, actual)) +
+    geom_ribbon(aes(ymin = lo95, ymax = hi95), alpha = .12) +
+    geom_ribbon(aes(ymin = lo80, ymax = hi80), alpha = .20) +
+    geom_line(size = 0.8) +
+    geom_line(aes(y = mean), linewidth = 0.9, linetype = "dashed") +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_minimal(base_size = 12)
+}
+
+adf_k <- function(x) trunc((length(na.omit(x)) - 1)^(1/3))
+
+
+# ---- Load & clean ----
+df <- read.csv("DAta.csv", stringsAsFactors = FALSE)
+
+norm_str <- function(x) tolower(trimws(as.character(x)))
+df <- df %>%
+  mutate(
+    series = norm_str(series),
+    sector = norm_str(sector),
+    value  = as.numeric(gsub(",", "", as.character(value)))
+  )
+
+d0 <- suppressWarnings(dmy(df$date))
+d1 <- suppressWarnings(ymd(df$date))
+d2 <- suppressWarnings(mdy(df$date))
+df$date <- coalesce(d0, d1, d2)
+stopifnot(!all(is.na(df$date)))
+
+abs_df <- df %>% filter(series == "abs", !is.na(value)) %>% arrange(date)
+
+# ---- Build p0, p1, share (quarterly) ----
+gdp  <- abs_df %>% filter(sector %in% c("p0","gdp","gross domestic product","jumlah","kdnk")) %>%
+  arrange(date) %>% select(date, p0 = value)
+agri <- abs_df %>% filter(sector %in% c("p1","agriculture","agriculture, forestry & fishing","pertanian")) %>%
+  arrange(date) %>% select(date, p1 = value)
+
+dat <- inner_join(gdp, agri, by = "date") %>% arrange(date)
+
+ts_p0 <- ts(dat$p0, start = c(year(min(dat$date)), quarter(min(dat$date))), frequency = 4)
+ts_p1 <- ts(dat$p1, start = start(ts_p0), frequency = 4)
+ts_share <- ts(100 * dat$p1/dat$p0, start = start(ts_p0), frequency = 4)
+
+# ==== Plots for p0, p1, and share ====
+
+# Tidy frame for plotting
+plot_dat <- dat %>%
+  mutate(share = 100 * p1/p0) %>%
+  rename(`GDP (p0)` = p0,
+         `Agriculture (p1)` = p1,
+         `Share of GDP (%)` = share)
+
+# 1) Individual charts -------------------------------------------------------
+p_p0 <- ggplot(plot_dat, aes(date, `GDP (p0)`)) +
+  geom_line(linewidth = 0.9) +
+  labs(title = "Total GDP (p0)", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+
+p_p1 <- ggplot(plot_dat, aes(date, `Agriculture (p1)`)) +
+  geom_line(linewidth = 0.9) +
+  labs(title = "Agriculture GDP (p1)", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+
+p_share <- ggplot(plot_dat, aes(date, `Share of GDP (%)`)) +
+  geom_line(linewidth = 0.9) +
+  labs(title = "Agriculture share of GDP (%)", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+
+# Print to the plot pane
+#p_p0; p_p1; p_share
+
+# 2) Faceted summary (each series on its own y-axis) -------------------------
+plot_long <- plot_dat |>
+  pivot_longer(cols = c(`GDP (p0)`, `Agriculture (p1)`, `Share of GDP (%)`),
+               names_to = "series", values_to = "value")
+
+p_facets <- ggplot(plot_long, aes(date, value)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~series, ncol = 1, scales = "free_y") +
+  labs(title = "GDP, Agriculture, and Share over time", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+
+p_facets
+
+# (Optional) mark COVID quarters (2020Q2, 2020Q3)
+covid_lines <- as.Date(c("2020-04-01", "2020-07-01"))
+p_p1 + geom_vline(xintercept = covid_lines, linetype = "dashed", alpha = .4)
+p_share + geom_vline(xintercept = covid_lines, linetype = "dashed", alpha = .4)
+p_p0 + geom_vline(xintercept = covid_lines, linetype = "dashed", alpha = .4)
+
+
+tq <- time(ts_p1)
+X <- cbind(
+  covid_q2     = as.numeric(tq == 2020 + 1/4),
+  covid_q3     = as.numeric(tq == 2020 + 2/4),
+  shock_2022q2 = as.numeric(tq == 2022 + 1/4)
+)
+# (Optional) Save to files
+# ggsave("plot_p0.png", p_p0, width = 8, height = 4, dpi = 150)
+# ggsave("plot_p1.png", p_p1, width = 8, height = 4, dpi = 150)
+# ggsave("plot_share.png", p_share, width = 8, height = 4, dpi = 150)
+# ggsave("plot_facets.png", p_facets, width = 9, height = 7, dpi = 150)
+
+
+# =========================
+# Pulses / Intervention Dummies (xreg)
+# =========================
+tq <- time(ts_p0)
+
+X <- cbind(
+  covid_q2     = as.numeric(tq == 2020 + 1/4),  # 2020Q2
+  covid_q3     = as.numeric(tq == 2020 + 2/4),  # 2020Q3
+  shock_2022q2 = as.numeric(tq == 2022 + 1/4)   # 2022Q2
+)
+
+X_ts <- ts(X, start = start(ts_p0), frequency = 4)
+
+# ---- A quick look ----
+ndiffs(ts_share); nsdiffs(ts_share)
+ggAcf(ts_share); ggPacf(ts_share)   # uncomment to view
+```
+
+```{r}
+
+# Put the two log series into a tibble
+df_plot <- tibble(
+  date = as.Date(time(log_p0)),
+  log_p0 = as.numeric(log_p0),
+  log_p1 = as.numeric(log_p1)
+) %>%
+  pivot_longer(cols = c(log_p0, log_p1),
+               names_to = "series",
+               values_to = "value")
+
+# Plot
+ggplot(df_plot, aes(x = date, y = value, color = series)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Log(p0) vs Log(p1)",
+       x = NULL,
+       y = "Log value",
+       color = "Series") +
+  theme_minimal(base_size = 12)
+```
+
+
+## Transformation
+
+```{r}
+# ===== Apply transformations =====
+# Log transformations
+log_p1 <- log(ts_p1)
+log_p0 <- log(ts_p0)
+
+# Share with log-transformed variables
+log_share <- log(ts_p1) / log(ts_p0)  # log(p1/p0)
+log_share_tgt <- log(ts_p1) - log(ts_p0)  # log(p1/p0)
+
+# ---- Quick Check of Transformations ----
+ndiffs(log_share); nsdiffs(log_share)   # Expect d=0, D=1 for log share
+autoplot(log_share) + ggtitle("Log Agriculture Share of GDP (%)")
+autoplot(log_p1) + ggtitle("Log Agriculture ")
+autoplot(log_p0) + ggtitle("Log GDP")
+
+# ---- ACF/PACF ----
+ggAcf(log_share)
+ggPacf(log_share)
+
+# ADF Test with differencing and lag 4 for log-transformed series
+adf_logp1_sdiff <- adf.test(diff(log(ts_p1), lag = 4), k = adf_k(log(ts_p1)))  # ADF on diff(log(p1))
+adf_logp0_sdiff <- adf.test(diff(log(ts_p0), lag = 4), k = adf_k(log(ts_p0)))  # ADF on diff(log(p0))
+adf_logshare_sdiff <- adf.test(diff(log(ts_share), lag = 4), k = adf_k(log(ts_share)))  # ADF on diff(log(share))
+
+# ADF Test for non-transformed series (without differencing)
+adf_p1_sdiff <- adf.test(diff(ts_p1, lag = 4), k = adf_k(ts_p1))  # ADF on diff(p1)
+adf_p0_sdiff <- adf.test(diff(ts_p0, lag = 4), k = adf_k(ts_p0))  # ADF on diff(p0)
+adf_share_sdiff <- adf.test(diff(ts_share, lag = 4), k = adf_k(ts_share))  # ADF on diff(share)
+
+# ADF Test without differencing for log-transformed series
+adf_logp1_lvl <- adf.test(log(ts_p1), k = adf_k(log(ts_p1)))  # ADF on log(p1) without differencing
+adf_logp0_lvl <- adf.test(log(ts_p0), k = adf_k(log(ts_p0)))  # ADF on log(p0) without differencing
+adf_logshare_lvl <- adf.test(log(ts_share), k = adf_k(log(ts_share)))  # ADF on log(share) without differencing
+
+# ADF Test for non-transformed data (without differencing)
+adf_p1_lvl <- adf.test(ts_p1, k = adf_k(ts_p1))  # ADF on p1 without differencing
+adf_p0_lvl <- adf.test(ts_p0, k = adf_k(ts_p0))  # ADF on p0 without differencing
+adf_share_lvl <- adf.test(ts_share, k = adf_k(ts_share))  # ADF on share without differencing
+
+# Print results for both log and non-log series
+print(adf_logp1_sdiff)  # Log(p1) with differencing
+print(adf_logp0_sdiff)  # Log(p0) with differencing
+print(adf_logshare_sdiff)  # Log(share) with differencing
+
+print(adf_logp1_lvl)  # Log(p1) without differencing
+print(adf_logp0_lvl)  # Log(p0) without differencing
+print(adf_logshare_lvl)  # Log(share) without differencing
+
+# Print results for non-log series
+print(adf_p1_sdiff)  # p1 with differencing
+print(adf_p0_sdiff)  # p0 with differencing
+print(adf_share_sdiff)  # share with differencing
+
+print(adf_p1_lvl)  # p1 without differencing
+print(adf_p0_lvl)  # p0 without differencing
+print(adf_share_lvl)  # share without differencing
+
+```
+
+## Stationarity and Cointegration Diagnostics
+
+In this section, we assess the time series properties of the GDP series:
+
+-   $p_0$: total GDP\
+-   $p_1$: agriculture GDP\
+-   $\text{share} = 100 \times p_1/p_0$
+-   and their log–transformations $\log(p_0)$, $\log(p_1)$,
+    $\log(\text{share})$.
+
+We use Augmented Dickey–Fuller (ADF) tests to check for
+(non)-stationarity and the Johansen test to check for cointegration
+between $\log(p_0)$ and $\log(p_1)$.
+
+```{r adf-setup, echo=TRUE, message=FALSE, warning=FALSE}
+
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(ggplot2)
+
+# Levels
+adf_p0_lvl    <- adf.test(ts_p0,    k = adf_k(ts_p0))
+adf_p1_lvl    <- adf.test(ts_p1,    k = adf_k(ts_p1))
+adf_share_lvl <- adf.test(ts_share, k = adf_k(ts_share))   # you ran this separately
+
+adf_p0_lvl
+adf_p1_lvl
+adf_share_lvl
+
+# Seasonal differences (D = 1, quarterly)
+adf_p0_sdiff    <- adf.test(diff(ts_p0,    lag = 4), k = adf_k(ts_p0))
+adf_p1_sdiff    <- adf.test(diff(ts_p1,    lag = 4), k = adf_k(ts_p1))
+adf_share_sdiff <- adf.test(diff(ts_share, lag = 4), k = adf_k(ts_share))
+
+adf_p0_sdiff
+adf_p1_sdiff
+adf_share_sdiff
+
+
+```
+
+-   **Summary (non-log series, based on your output):**
+
+-   **Share in levels `tsshare`** :ADF statistic ≈ −1.81, p-value ≈
+    **0.65** → **fail to reject** the unit-root null.⇒ The share series
+    is **non-stationary in levels**.
+
+-   **Seasonally differenced series `diff(ts_p1, lag = 4)` and
+    `diff(ts_share, lag = 4)`**:You obtained p-values around
+    **0.02–0.09**, which are **much lower** than in levels and
+    consistent with the seasonal differencing identified by nsdiffs()⇒
+    After seasonal differencing (lag 4), the series behave much closer
+    to **stationary**.
+
+```{r}
+# Logs: levels
+adf_logp0_lvl    <- adf.test(log_p0,    k = adf_k(log_p0))
+adf_logp1_lvl    <- adf.test(log_p1,    k = adf_k(log_p1))
+adf_logshare_lvl <- adf.test(log_share, k = adf_k(log_share))
+
+adf_logp0_lvl
+adf_logp1_lvl
+adf_logshare_lvl
+
+# Logs: seasonal difference (lag = 4)
+adf_logp0_sdiff    <- adf.test(diff(log_p0,    lag = 4), k = adf_k(log_p0))
+adf_logp1_sdiff    <- adf.test(diff(log_p1,    lag = 4), k = adf_k(log_p1))
+adf_logshare_sdiff <- adf.test(diff(log_share, lag = 4), k = adf_k(log_share))
+
+adf_logp0_sdiff
+adf_logp1_sdiff
+adf_logshare_sdiff
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+library(knitr)
+
+############################################
+# 1) LOG SERIES (LEVELS)
+############################################
+
+log_levels <- data.frame(
+  Series = c("log(p1)", "log(p0)", "log(share)"),
+  ADF_Statistic = c(-1.8918, -1.8690, -1.7707),
+  Lag = 3,
+  p_value = c(0.6163, 0.6253, 0.6640),
+  Stationary = c("No", "No", "No")
+)
+
+kable(log_levels,
+      caption = "ADF Test: Log-Transformed Series (No Differencing)",
+      digits = 5, align = "c")
+
+
+############################################
+# 2) LOG SERIES (SEASONALLY DIFFERENCED, LAG 4)
+############################################
+
+log_diff4 <- data.frame(
+  Series = c("diff(log(p1))", "diff(log(p0))", "diff(log(share))"),
+  ADF_Statistic = c(-3.9482, -3.2645, -3.4654),
+  Lag = 3,
+  p_value = c(0.02231, 0.09218, 0.06271),
+  Stationary = c("Yes*", "Borderline", "Borderline")
+)
+
+kable(log_diff4,
+      caption = "ADF Test: Log-Transformed Series with Seasonal Differencing (lag = 4)",
+      digits = 5, align = "c")
+
+
+############################################
+# 3) RAW SERIES (LEVELS, NO LOG, NO DIFFERENCING)
+############################################
+
+raw_levels <- data.frame(
+  Series = c("p1", "p0", "share"),
+  ADF_Statistic = c(-1.9530, -1.7279, -1.8086),
+  Lag = 3,
+  p_value = c(0.5922, 0.6809, 0.6491),
+  Stationary = c("No", "No", "No")
+)
+
+kable(raw_levels,
+      caption = "ADF Test: Raw Series (No Differencing)",
+      digits = 5, align = "c")
+
+
+############################################
+# 4) RAW SERIES (SEASONALLY DIFFERENCED, LAG 4)
+############################################
+
+raw_diff4 <- data.frame(
+  Series = c("diff(p1)", "diff(p0)", "diff(share)"),
+  ADF_Statistic = c(-4.0247, -3.3309, -3.5000),
+  Lag = 3,
+  p_value = c(0.01938, 0.08244, 0.05762),
+  Stationary = c("Yes*", "Borderline", "Borderline")
+)
+
+kable(raw_diff4,
+      caption = "ADF Test: Raw Series with Seasonal Differencing (lag = 4)",
+      digits = 5, align = "c")
+
+```
+
+
+
+
+#### **Table 1 — Log levels (not stationary)**
+All log-level series have very high p-values (>0.60) → clearly **non-stationary**.
+
+#### **Table 2 — Log-differenced seasonal**
+- log(p1) is **stationary** after seasonal difference  
+- log(p0) and log(share) are **borderline** (close to 5%)
+
+#### **Table 3 — Raw levels (not stationary)**
+p1, p0, share all fail stationarity (p > 0.59).
+
+#### **Table 4 — Raw seasonal diff**
+- p1 becomes **stationary** (p = 0.019)  
+- p0 and share are borderline
+
+---
+
+**Conclusion:**  
+All three series require **seasonal log-differencing (Δ₄ log())** before modelling → which matches your VARMAX specification.
+
+
+## 4. Stationarity, Cointegration, and Model Justification
+
+Before specifying the multivariate time-series model, the level series
+for total GDP ($p_0$) and agriculture GDP ($p_1$) were transformed into
+logarithms. Unit root tests using the Augmented Dickey–Fuller (ADF)
+procedure indicate that both $\log(p_0)$ and $\log(p_1)$ are
+non–stationary in levels (ADF $p$–values $>$ 0.60).
+
+Seasonal differencing of order four was applied to reflect the quarterly
+structure of the data:
+
+$$ \Delta_4 \log(p_t) = \log(p_t) - \log(p_{t-4}). $$
+
+After this transformation, the ADF tests show substantially lower
+$p$–values (approximately 0.02–0.09), indicating that the seasonal
+log-differences are stationary or near–stationary. This implies the
+series behave like I(1) processes with seasonal integration.
+
+To evaluate whether the two GDP components share a long–run equilibrium,
+the Johansen cointegration test was applied to the vector
+$\left[\log(p_0),\ \log(p_1)\right]$. Both the trace and
+maximum–eigenvalue statistics fail to reject the null hypothesis of no
+cointegration ($r=0$). Therefore, there is no evidence of a stable
+long–run cointegration relationship between the two logged GDP series.
+
+The implications for modelling are clear:
+
+-   Because the variables are non–stationary in levels but **not
+    cointegrated**, a **VECM is not appropriate**.
+-   Instead, the correct specification is a VAR model estimated on the
+    **stationary transformed series** $\Delta_4\log(p_0)$ and
+    $\Delta_4\log(p_1)$.
+
+Moreover, the series contain identifiable structural shocks in 2020Q2–Q3
+(COVID–19 lockdowns) and 2022Q2 (post-COVID agricultural spike). These
+are better handled through exogenous intervention dummies rather than
+forcing the VAR dynamics to absorb large outliers. Therefore, a VAR with
+exogenous regressors (VARX) is the preferred specification.
+
+```{r pressure, echo=FALSE}
+library(urca)
+
+y_pair <- cbind(log_p1, log_p0)
+
+# Example specification matching your output:
+jo_test <- ca.jo(y_pair,
+                 type  = "trace",
+                 K     = 2,
+                 ecdet = "const")  # constant in cointegration space
+
+summary(jo_test)
+```
+
+-   For **r = 0** (no cointegration):test = 14.71 \< 17.85 (10% critical
+    value)⇒ **Fail to reject H₀ of no cointegration.**
+
+-   For **r ≤ 1**:test = 4.68 \< 7.52 (10% critical value)⇒ Also fail to
+    reject.
+
+**Conclusion (cointegration):**
+
+Under this specification, the Johansen trace test **does not find
+evidence of cointegration** between $log(p_1)$ and $log(p_0)$. In other
+words, although both series are non-stationary in levels, they **do not
+share a statistically significant long-run equilibrium relationship** in
+the sense of cointegration.
+
+Therefore:
+
+-   It is appropriate to model **each series separately** using
+    ARIMA/SARIMA in (seasonal) differences; and
+
+-   For the **contribution share** (either in levels or logs), it is
+    reasonable to model it directly (e.g. SARIMA or SARIMAX), rather
+    than imposing a VECM structure based on a cointegrating relationship
+    between $log⁡(p0$) and $log⁡(p1$).
+
+```{r}
+library(vars)
+library(lmtest)
+# --- Log levels ---
+log_p0 <- log(ts_p0)
+log_p1 <- log(ts_p1)
+
+# --- Seasonal differences (D = 1, quarterly) ---
+d4_log_p0 <- diff(ts_p0, lag = 4)  # approx yearly log growth of total GDP
+d4_log_p1 <- diff(ts_p1, lag = 4)  # approx yearly log growth of agriculture GDP
+
+# Put into a bivariate ts object for VAR
+start0 <- start(ts_p0)  # e.g. c(2010, 1)
+y_var <- ts(
+  cbind(d4_log_p0, d4_log_p1),
+  start = c(start0[1] + 1, start0[2]),  # 1 year later because lag = 4
+  frequency = 4
+)
+colnames(y_var) <- c("d4_log_p0", "d4_log_p1")
+
+# Time index for differenced series
+t_y <- time(y_var)
+
+# Match rows of X to the times in y_var
+X_var <- X[match(t_y, tq), , drop = FALSE]
+
+```
+
+
+## 4.0 Methodology: VARMAX Modelling of Agriculture GDP and Total GDP
+
+### 4.1 Selection of Optimal Lag Order
+
+```{r}
+# Choose lag order (e.g. up to 4 lags for quarterly data)
+lag_sel <- VARselect(y_var, lag.max = 4, type = "const", exogen = X_var)
+lag_sel
+
+p_opt <- lag_sel$selection["AIC(n)"]  # or choose BIC if you prefer
+
+
+```
+
+
+
+The optimal lag length was chosen using the `VARselect()` function in R, which evaluates several information criteria:
+
+- Akaike Information Criterion (AIC)
+- Hannan–Quinn Criterion (HQ)
+- Schwarz Criterion (SC)
+- Final Prediction Error (FPE)
+
+`VARselect()` recommended:
+
+- **lag = 4** according to AIC, HQ, and FPE  
+- **lag = 1** according to SC  
+
+Since AIC, HQ, and FPE penalise residual structure less harshly and prioritize predictive accuracy,  
+a **VAR(4)** model was chosen.
+
+This is similar to how `auto.arima()` selects ARIMA orders—  
+VARselect is the multivariate equivalent for VAR models.
+
+### 4.3 Incorporating Exogenous Shocks (VARX / VARMAX Structure)
+
+```{r}
+var_fit <- VAR(
+  y_var,
+  p      = p_opt,
+  type   = "const",
+  exogen = X_var
+)
+
+summary(var_fit)
+
+```
+
+
+
+
+The pandemic (2020Q2–Q3) and the 2022Q2 shock produced large residual spikes in earlier ARIMA models.  
+To avoid contaminating the VAR residual structure, three intervention dummy variables were introduced:
+
+- `covid_q2` = 1 in 2020Q2, 0 otherwise  
+- `covid_q3` = 1 in 2020Q3, 0 otherwise  
+- `shock_2022q2` = 1 in 2022Q2, 0 otherwise  
+
+Thus the system becomes a **VARMAX model**:
+
+\[
+y_t = c + A_1 y_{t-1} + \cdots + A_4 y_{t-4} + B X_t + u_t
+\]
+
+where:
+
+- $y_t$ = vector of endogenous variables  
+- $A_i$ = autoregressive coefficient matrices  
+- $X_t$ = exogenous shock dummy variables  
+- $B$ = matrix of exogenous effects  
+- $u_t$ = vector of white-noise errors  
+
+```{r}
+#run this if dw exogenus
+var_fit_nox <- VAR(y_var, p = p_opt, type = "const")
+summary(var_fit_nox)
+
+```
+
+
+
+### Results and Dynamic Contribution of Agriculture to GDP
+
+We estimate a bivariate VAR model for the seasonal log–growth rates of
+total and agricultural GDP. Let $d4\_log\_p0 = \Delta_4 \log(p_0)$
+denote the quarterly seasonal difference of total real GDP and
+$d4\_log\_p1 = \Delta_4 \log(p_1)$ the corresponding series for
+agricultural GDP. The lag order $p=4$ is chosen using AIC, HQ and FPE
+criteria.
+
+Two specifications are considered:
+
+1.  A baseline VAR(4) with only a constant term.
+2.  A VAR(4) with exogenous intervention dummies (`covid_q2`,
+    `covid_q3`, `shock_2022q2`) capturing the COVID-19 recession in
+    2020Q2–Q3 and the post-COVID rebound in 2022Q2.
+
+#### VAR with exogenous interventions
+
+For the equation in $d4\_log\_p0$, the coefficients on its own lags at
+horizons 2–4 are significant, while the lags of $d4\_log\_p1$ are not.
+The dummy `covid_q2` enters with a large negative and highly significant
+coefficient, indicating a sharp contraction in aggregate GDP growth
+during 2020Q2, whereas `shock_2022q2` is significantly positive,
+consistent with a strong rebound in 2022Q2. The adjusted $R^2$ of this
+equation is approximately 0.79.
+
+In the equation for $d4\_log\_p1$, the first lag of agricultural growth
+$d4\_log\_p1.l1$ is positive and highly significant, indicating
+persistence in agricultural growth. The first lag of aggregate GDP
+growth $d4\_log\_p0.l1$ is significantly negative, suggesting that
+unusually strong aggregate growth in one quarter is followed by
+relatively weaker agricultural growth in the next. The 2022Q2 dummy has
+a positive, borderline-significant effect, while the COVID dummies are
+not significant in this equation. The adjusted $R^2$ is about 0.73.
+
+When the intervention dummies are omitted (baseline VAR), the adjusted
+$R^2$ for the $d4\_log\_p0$ equation falls from roughly 0.79 to 0.23 and
+the residual variance roughly doubles. This confirms that the large
+COVID-19 and 2022Q2 movements are better modelled as exogenous
+interventions than forced into the autoregressive dynamics. We therefore
+treat the VAR with exogenous dummies as the preferred VARX
+specification.
+
+
+# 5. Check “contribution” of $p_1$ to $p_0$
+
+## (a) Granger causality
+
+Does agriculture growth Granger-cause total GDP growth?
+
+```{r}
+# Does d4_log_p1 help predict d4_log_p0?
+causality(var_fit, cause = "d4_log_p1")
+
+# (Optional) reverse direction:
+causality(var_fit, cause = "d4_log_p0")
+
+#If the p-value in the first test is small (< 0.05), you can say
+#“Agricultural GDP growth Granger-causes total GDP growth in the VAR model.
+```
+
+Two null hypotheses were tested:
+
+1. **$p_1$ does NOT Granger-cause $p_0$**  
+   - p = 0.9539 → fail to reject H0  
+   - **Agriculture does not drive total GDP**
+
+2. **$p_0$ does NOT Granger-cause $p_1$**  
+   - p = 0.0620 → marginal evidence  
+   - **Total GDP may influence agriculture**, but weakly
+
+Instantaneous causality tests showed **no contemporaneous correlation** between the shocks in both equations.
+
+
+
+
+Granger causality tests based on the baseline VAR indicate that
+agricultural growth does not Granger-cause aggregate GDP growth: the
+F-test for the null hypothesis “$d4\_log\_p1$ does not Granger-cause
+$d4\_log\_p0$” has a p-value of about 0.95, so the null cannot be
+rejected. In contrast, the null “$d4\_log\_p0$ does not Granger-cause
+$d4\_log\_p1$” yields a p-value around 0.06, which provides weak (10%
+level) evidence that aggregate GDP growth helps predict future
+agricultural growth.
+
+Instantaneous causality tests, which examine the covariance of the VAR
+residuals conditional on all lags, show no evidence of contemporaneous
+dependence between $d4\_log\_p0$ and $d4\_log\_p1$ (Chi-squared p-value
+≈ 0.89). After controlling for lagged values, shocks to agriculture and
+total GDP within the same quarter appear to be statistically
+independent.
+
+## (b) Impulse Response Functions (IRF)
+
+```{r}
+irf_p1_to_p0 <- irf(
+  var_fit,
+  impulse  = "d4_log_p1",
+  response = "d4_log_p0",
+  n.ahead  = 8,   # 8 quarters ahead
+  boot     = TRUE
+)
+
+plot(irf_p1_to_p0)
+```
+
+Orthogonal impulse response functions (IRFs) from the preferred VARX
+model show that a one–standard deviation shock to agricultural growth
+($d4\_log\_p1$) has only a very small effect on aggregate GDP growth
+($d4\_log\_p0$) at all horizons. The 95% bootstrap confidence intervals
+always include zero, implying that the dynamic effect is not
+statistically significant.
+
+Forecast error variance decompositions (FEVDs) further confirm this
+result. At all horizons, almost all of the forecast error variance of
+$d4\_log\_p0$ is explained by its own shocks, with only a very small
+share attributable to shocks in $d4\_log\_p1$. Similarly, the variance
+of $d4\_log\_p1$ is dominated by its own innovations. Thus, the
+contribution of agriculture-specific shocks to the short-run variability
+of aggregate GDP appears to be limited.
+
+## (c) Forecast Error Variance Decomposition (FEVD)
+
+```{r}
+fevd_fit <- fevd(var_fit, n.ahead = 8)
+plot(fevd_fit)
+
+
+```
+
+Overall, the VAR analysis suggests that, in quarterly seasonal
+log-growth terms, agricultural GDP does not exert a strong dynamic
+influence on aggregate GDP in Malaysia over the sample period. The main
+determinants of total GDP growth are its own past values and large
+exogenous shocks such as the COVID-19 recession and subsequent rebound.
+There is some weak evidence that aggregate GDP growth helps to predict
+agricultural growth, but impulse responses and variance decompositions
+indicate that these cross-effects are economically small.
+
+
+
+## 5. Final Model Choice: VAR/VARX in Seasonal Log-Differences
+
+The final multivariate specification is a VAR($p$) model for quarterly
+GDP growth components:
+
+$$
+\begin{bmatrix}
+\Delta_4 \log(p_{0,t}) \\
+\Delta_4 \log(p_{1,t})
+\end{bmatrix}
+=
+A_1
+\begin{bmatrix}
+\Delta_4 \log(p_{0,t-1}) \\
+\Delta_4 \log(p_{1,t-1})
+\end{bmatrix}
++ \cdots +
+A_p
+\begin{bmatrix}
+\Delta_4 \log(p_{0,t-p}) \\
+\Delta_4 \log(p_{1,t-p})
+\end{bmatrix}
++ B X_t + \varepsilon_t,
+$$
+
+where $X_t$ contains intervention dummies for:
+
+-   2020Q2 (COVID shock),
+-   2020Q3 (COVID shock),
+-   2022Q2 (post-pandemic agricultural spike).
+
+Using standard information criteria (AIC, HQ and FPE), the optimal lag
+length is $p = 4$, while the Schwarz Criterion suggests $p = 1$. Given
+the quarterly economic structure and the agreement of three criteria,
+the VAR(4) specification is adopted.
+
+This VARX(4) model is equivalent to a VARMAX model with only
+autoregressive terms, providing:
+
+-   Granger causality analysis to test whether agriculture growth
+    predicts GDP growth,
+-   impulse response functions (IRFs) to quantify dynamic effects of
+    shocks to $p_1$ on $p_0$,
+-   forecast error variance decomposition (FEVD) to measure the
+    contribution of agriculture fluctuations to GDP variability.
+
+The absence of cointegration, combined with seasonal stationarity and
+identifiable exogenous shocks, supports the VAR/VARX framework as the
+most theoretically consistent and empirically suitable approach for
+analysing the contribution of agriculture to GDP.
+
+------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+### 4.4 Estimation Results
+
+The VARMAX(4) estimate produces two equations:
+
+- Equation 1: $\Delta_4 \log(p_{0,t})$  
+- Equation 2: $\Delta_4 \log(p_{1,t})$
+
+Key findings:
+
+#### (a) Total GDP equation ($\Delta_4 \log(p_0)$)
+
+- Significant autoregressive terms at lags 2, 3, and –4  
+- COVID-19 Q2 dummy: **large negative effect** (p < 0.001)  
+- 2022Q2 shock: **positive and significant** (p < 0.001)  
+- Agriculture GDP lags are **not statistically significant**  
+
+This implies **agriculture does not significantly predict total GDP growth** in the short run.
+
+#### (b) Agriculture GDP equation ($\Delta_4 \log(p_1)$)
+
+- Strong own-lag dependence (lag 1, p < 0.01)
+- Total GDP lag 1 has mild predictive power (p = 0.036)
+- 2022Q2 shock borderline significant (p = 0.099)
+
+This suggests **total GDP growth may influence agricultural GDP**, but the effect is small and short-lived.
+
+### 4.5 Granger Causality Results
+
+Two null hypotheses were tested:
+
+1. **$p_1$ does NOT Granger-cause $p_0$**  
+   - p = 0.9539 → fail to reject H0  
+   - **Agriculture does not drive total GDP**
+
+2. **$p_0$ does NOT Granger-cause $p_1$**  
+   - p = 0.0620 → marginal evidence  
+   - **Total GDP may influence agriculture**, but weakly
+
+Instantaneous causality tests showed **no contemporaneous correlation** between the shocks in both equations.
+
+### 4.6 Interpretation of Diagnostics
+
+- System stability: All VAR roots < 1 → model is stable  
+- Residual correlation ≈ 0 → equations are properly separated  
+- Good fit for agriculture equation (Adjusted $R^2 = 0.73$)  
+- Strong improvement when exogenous dummies are included  
+  (without dummies, model fit decreases significantly)
+
+### 4.7 Economic Interpretation
+
+- Agriculture GDP does **not** Granger-cause total GDP  
+  → Agriculture sector reacts to the overall economy rather than driving it  
+- Total GDP shows minor predictive power for agriculture  
+  → Agriculture behaves as a dependent subsector  
+- COVID-19 had a **severe, short-run negative impact** on total GDP  
+- The 2022Q2 shock had a **positive impact**, possibly due to reopening, stimulus, or commodity price recovery
+
+### 4.8 Conclusion: Why VARMAX(4) is Appropriate
+
+The VARMAX(4) model is suitable because:
+
+1. The series are **non-stationary in levels but stationary in seasonal log-differences**  
+2. There is **no cointegration**, so VECM is inappropriate  
+3. VARselect indicates **lag 4** is optimal  
+4. COVID-19 and 2022Q2 shocks create structural breaks → handled via exogenous terms  
+5. The model provides  
+   - Granger causality  
+   - Impulse response functions  
+   - Forecast error variance decomposition (FEVD)  
+   → allowing quantitative interpretation of agriculture’s contribution to GDP
+
+Overall, the VARMAX(4) framework provides a statistically consistent and economically meaningful way to analyse dynamic interactions between agriculture GDP and total GDP.
+
+```{r}
+
+d4_log_p0 <- diff(log(ts_p0), lag = 4)
+d4_log_p1 <- diff(log(ts_p1), lag = 4)
+
+tq <- time(d4_log_p0)  # same time index for both logs
+X_var <- cbind(
+  covid_q2     = as.numeric(tq == 2020 + 1/4),
+  covid_q3     = as.numeric(tq == 2020 + 2/4),
+  shock_2022q2 = as.numeric(tq == 2022 + 1/4)
+)
+p_opt <- 4  # for example
+y_var <- cbind(d4_log_p0, d4_log_p1)   # this becomes an "mts" object
+colnames(y_var) <- c("d4_log_p0", "d4_log_p1")
+
+cut_num   <- 2023 + 3/4      # 2023Q4 in fractional time
+train_ms  <- tq <= cut_num   # logical mask for training
+test_ms   <- tq >  cut_num   # logical mask for test
+
+train_y   <- y_var[train_ms, ]
+test_y    <- y_var[test_ms, ]
+
+X_train   <- X_var[train_ms, , drop = FALSE]
+X_test    <- X_var[test_ms,  , drop = FALSE]
+
+library(vars)
+
+var_train <- VAR(
+  y     = train_y,
+  p     = p_opt,
+  type  = "const",
+  exogen = X_train      # not X_var!
+)
+
+summary(var_train)
+
+h <- nrow(test_y)
+
+fc_var <- predict(
+  var_train,
+  n.ahead = h,
+  dumvar  = X_test          # exogenous dummies over test horizon
+)
+
+# Extract point forecasts
+fc_d4_p0 <- fc_var$fcst$d4_log_p0[, "fcst"]
+fc_d4_p1 <- fc_var$fcst$d4_log_p1[, "fcst"]
+
+## 2. Build a date index for the test period (2024–2025)
+t_test <- tq[test_ms]
+
+q_to_month <- function(q) c(1, 4, 7, 10)[q]
+yy <- floor(t_test)
+qq <- (round((t_test - yy) * 4) %% 4) + 1
+dates_test <- as.Date(sprintf("%04d-%02d-01", yy, q_to_month(qq)))
+
+## 3. Tidy data frame for plotting
+df_plot <- tibble(
+  date     = rep(dates_test, 2),
+  series   = rep(c("d4_log_p0", "d4_log_p1"), each = h),
+  actual   = c(test_y[, "d4_log_p0"], test_y[, "d4_log_p1"]),
+  forecast = c(fc_d4_p0,             fc_d4_p1)
+)
+
+## 4. Plot actual vs forecast (2024–2025)
+ggplot(df_plot, aes(x = date)) +
+  geom_line(aes(y = actual, colour = "Actual"), linewidth = 1) +
+  geom_line(aes(y = forecast, colour = "Forecast"), linewidth = 1, linetype = "dashed") +
+  facet_wrap(~series, ncol = 1, scales = "free_y") +
+  labs(
+    title = "VAR forecast vs actual (2024–2025)",
+    x = "Date", y = "Quarterly seasonal log-difference",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+## 5. Optional: error metrics for each series
+df_errors <- df_plot |>
+  mutate(error = actual - forecast) |>
+  group_by(series) |>
+  summarise(
+    RMSE = sqrt(mean(error^2)),
+    MAE  = mean(abs(error)),
+    MAPE = mean(abs(error / actual)) * 100
+  )
+
+print(df_errors)
+
+```
+```{r}
+library(vars)
+library(tidyverse)
+library(ggplot2)
+
+## 1. Build seasonal differences in LEVELS (no logs)
+d4_p0 <- diff(ts_p0, lag = 4)   # Δ4 p0
+d4_p1 <- diff(ts_p1, lag = 4)   # Δ4 p1
+
+# Combine into a bivariate mts
+y_var_d4 <- cbind(d4_p0 = d4_p0,
+                  d4_p1 = d4_p1)
+
+# Time index for this differenced series
+tq_d4 <- time(d4_p0)
+
+## 2. (Optional) intervention dummies on the differenced series
+covid_q2_d4     <- as.numeric(tq_d4 == 2020 + 1/4)
+covid_q3_d4     <- as.numeric(tq_d4 == 2020 + 2/4)
+shock_2022q2_d4 <- as.numeric(tq_d4 == 2022 + 1/4)
+
+X_d4_mat <- cbind(
+  covid_q2     = covid_q2_d4,
+  covid_q3     = covid_q3_d4,
+  shock_2022q2 = shock_2022q2_d4
+)
+
+# Make exogenous dummies a ts so we can use window()
+X_d4 <- ts(X_d4_mat,
+           start = start(d4_p0),
+           frequency = frequency(d4_p0))
+
+## 3. Choose lag order for VAR on differenced levels
+lag_sel_d4 <- VARselect(y_var_d4, lag.max = 4, type = "const", exogen = X_d4)
+lag_sel_d4$selection
+p_opt_d4 <- lag_sel_d4$selection["AIC(n)"]  # or SC(n), HQ(n) if you prefer
+
+## 4. Split into train (up to 2023Q4) and test (2024Q1–2025Q4)
+train_y_d4 <- window(y_var_d4, end   = c(2023, 4))
+test_y_d4  <- window(y_var_d4, start = c(2024, 1))
+
+X_train_d4 <- window(X_d4, end   = c(2023, 4))
+X_test_d4  <- window(X_d4, start = c(2024, 1))
+
+h <- nrow(test_y_d4)
+
+## 5. Fit VAR on training sample (levels, seasonal diff)
+var_train_d4 <- VAR(train_y_d4,
+                    p     = p_opt_d4,
+                    type  = "const",
+                    exogen = X_train_d4)
+
+summary(var_train_d4)
+
+## 6. Forecast 2024–2025 with VAR
+fc_d4 <- predict(var_train_d4,
+                 n.ahead = h,
+                 dumvar  = X_test_d4)
+
+# Extract point forecasts for each series
+fc_d4_p0 <- fc_d4$fcst$d4_p0[, "fcst"]
+fc_d4_p1 <- fc_d4$fcst$d4_p1[, "fcst"]
+
+## 7. Build dates for test horizon (2024–2025)
+t_test_d4 <- time(test_y_d4)
+
+q_to_month <- function(q) c(1, 4, 7, 10)[q]
+yy <- floor(t_test_d4)
+qq <- (round((t_test_d4 - yy) * 4) %% 4) + 1
+dates_test_d4 <- as.Date(sprintf("%04d-%02d-01", yy, q_to_month(qq)))
+
+## 8. Tidy data for plotting actual vs forecast
+df_plot_d4 <- tibble(
+  date     = rep(dates_test_d4, 2),
+  series   = rep(c("d4_p0 (Δ4 GDP)", "d4_p1 (Δ4 Agri)"), each = h),
+  actual   = c(test_y_d4[, "d4_p0"], test_y_d4[, "d4_p1"]),
+  forecast = c(fc_d4_p0,            fc_d4_p1)
+)
+
+## 9. Plot: actual vs forecast for 2024–2025
+ggplot(df_plot_d4, aes(x = date)) +
+  geom_line(aes(y = actual, colour = "Actual"), linewidth = 1) +
+  geom_line(aes(y = forecast, colour = "Forecast"), linewidth = 1,
+            linetype = "dashed") +
+  facet_wrap(~series, ncol = 1, scales = "free_y") +
+  labs(
+    title = "VAR on Δ4 levels: forecast vs actual (2024–2025)",
+    x = "Date",
+    y = "Seasonal difference (Δ4 in levels)",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+## 10. Error metrics (RMSE, MAE, MAPE) for each series
+df_errors_d4 <- df_plot_d4 |>
+  mutate(error = actual - forecast) |>
+  group_by(series) |>
+  summarise(
+    RMSE = sqrt(mean(error^2)),
+    MAE  = mean(abs(error)),
+    MAPE = mean(abs(error / actual)) * 100
+  )
+
+print(df_errors_d4)
+
+```
+
+```{r}
+
+```
+
